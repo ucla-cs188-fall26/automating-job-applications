@@ -152,6 +152,9 @@ def main(argv: list[str] | None = None) -> int:
     fill.add_argument("--model", default="0.6b", choices=["none", "0.6b", "1.7b", "4b"])
     fill.add_argument("--resume", type=Path)
     fill.add_argument("--workday-accounts", action="store_true", help="Create/sign in to Workday accounts using macOS Keychain")
+    mode = fill.add_mutually_exclusive_group()
+    mode.add_argument("--unattended", dest="unattended", action="store_true", default=None, help="Never prompt in the terminal; use saved answers and report unresolved fields")
+    mode.add_argument("--interactive", dest="unattended", action="store_false", help="Ask for missing answers, overriding the saved unattended setting")
     fill.set_defaults(func=cmd_fill)
 
     eval_forms = sub.add_parser("eval-forms", help="Score the local fictional application suite")
@@ -474,6 +477,8 @@ def cmd_fill(args: argparse.Namespace) -> int:
     from pocket_agent.forms.policy import is_sensitive_key
     from pocket_agent.forms.seed import seed_memory
 
+    if args.unattended is None:
+        args.unattended = bool((load_config().get("fill") or {}).get("unattended", False))
     home = data_home()
     profile_path = home / "profile.yaml"
     if not profile_path.exists():
@@ -498,13 +503,14 @@ def cmd_fill(args: argparse.Namespace) -> int:
             return 1
         email = str(profile.get("email") or "")
         if not email:
-            print("No email was found in the resume. Add your email to the resume and retry.")
+            print("No email was found in the resume or profile. Add it to either source and retry.")
             return 1
         if not account_scope(args.url):
             print("--workday-accounts requires an HTTPS Workday career-site URL.")
             return 1
         try:
-            accounts = WorkdayAccounts(args.url, str(profile.get("email") or ""), KeychainCredentials(), getpass, default_password=os.environ.get("POCKET_AGENT_ACCOUNT_PASSWORD"))
+            password_prompt = (lambda _: "") if args.unattended else getpass
+            accounts = WorkdayAccounts(args.url, str(profile.get("email") or ""), KeychainCredentials(), password_prompt, default_password=os.environ.get("POCKET_AGENT_ACCOUNT_PASSWORD"))
         except RuntimeError as exc:
             print(str(exc))
             return 1
@@ -515,7 +521,13 @@ def cmd_fill(args: argparse.Namespace) -> int:
         print(f"Form model fallback is off ({decider.error}). Known fields still fill from memory.")
         decider = None
 
+    unresolved: list[str] = []
+
     def ask(asked: Asked) -> UserAnswer:
+        if args.unattended:
+            if asked.label not in unresolved:
+                unresolved.append(asked.label)
+            return UserAnswer("", skip=True)
         print(asked.question)
         value = input("> ").strip()
         always = False
@@ -547,6 +559,8 @@ def cmd_fill(args: argparse.Namespace) -> int:
                         continue
             if not account_message:
                 print(_GATE_HELP.get(runs[-1].gate, f"Stopped at a {runs[-1].gate} page."))
+            if args.unattended:
+                break
             print("After completing the indicated step, press Enter to continue (or type q to stop).")
             try:
                 if input("> ").strip().lower() in {"q", "quit", "stop"}:
@@ -557,7 +571,21 @@ def cmd_fill(args: argparse.Namespace) -> int:
         run = runs[-1]
         run.outcomes = [outcome for item in runs for outcome in item.outcomes]
         run.submits = max(item.submits for item in runs)
-        if not run.gate and not run.error:
+        if args.unattended:
+            import json
+            report_path = home / "last-fill-report.json"
+            report_path.write_text(json.dumps({"url": args.url, "status": run.status, "current_step": run.current_step, "gate": run.gate, "error": run.error, "unresolved": unresolved, "submits": run.submits}, indent=2))
+            print(f"Unattended run {run.status}. Current step: {run.current_step or 'unknown'}. Unresolved fields: {len(unresolved)}. Report: {report_path}")
+            if run.error:
+                print(run.error)
+            for label in unresolved:
+                print(f"needs answer: {label}")
+            print("Browser left open for review. Close the browser window to exit.")
+            try:
+                page.wait_for_event("close", timeout=0)
+            except Exception:
+                pass
+        elif not run.gate and not run.error:
             print("Stopped before submit. Review the browser window and submit it yourself, then press Enter to close it.")
             try:
                 input()
@@ -566,6 +594,8 @@ def cmd_fill(args: argparse.Namespace) -> int:
         browser.close()
     memory.close()
     _print_fill(run)
+    if args.unattended and (run.gate or unresolved) and not run.submits and not run.error:
+        return 2
     return 1 if run.submits or run.error else 0
 
 

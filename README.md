@@ -42,6 +42,56 @@ uv run pocket-agent eval-forms --suite hard --runs 3 --model 0.6b --out form-eva
 
 ### Workday accounts (macOS)
 
+Add `--unattended` to run without terminal prompts. Saved profile/memory answers
+are used, unresolved fields are skipped without overwriting saved answers, and
+account/verification blockers stop automation without waiting for terminal input.
+The browser stays open for review; closing it exits the command. A summary is
+written to `~/.pocket-agent/last-fill-report.json`; unresolved fields or a gate
+produce exit code 2. Final submission remains manual.
+The report includes the active step and a `review`, `blocked`, or `stopped` status;
+zero unresolved answers alone does not mean the application reached Review.
+
+To make this the default, set `fill: {unattended: true}` in
+`~/.pocket-agent/config.yaml`. Use `--interactive` to override it for one run.
+Optional fields, including optional disclosure/preference checkboxes, are left
+unchanged unless an explicit reusable answer exists. They do not trigger a
+question simply because their wording matches an always-ask category.
+
+Reusable answers can be configured in `~/.pocket-agent/profile.yaml`:
+
+Resume contact facts take priority; missing contact facts fall back to the personal
+section and existing profile fields. The personal section also supplies facts that
+typically are not on a resume:
+
+```yaml
+personal:
+  email: ""  # Optional fallback if the resume has no email
+  phone: ""
+  address_line_1: ""
+  address_line_2: ""
+  city: ""
+  region: ""
+  postal_code: ""
+  county: ""
+  country: ""
+```
+
+Fill those values once; empty values are not guessed. Address lines, postal code,
+and county map to the corresponding application fields. Resume parsing currently
+extracts contact facts, not every education/employment fact; the existing structured
+education, experience, citizenship and preferences sections remain the fallback
+for those fields. For reusable question answers:
+
+```yaml
+form_answers:
+  how_did_you_hear: Simplify
+```
+
+For sensitive questions an explicit mapping such as
+`{value: "Decline to answer", always_use: true}` is required to reuse an answer.
+Missing required facts can still prevent a site from advancing; unattended mode
+reports those facts instead of inventing them.
+
 Install the optional Keychain dependency, then enable account handling for a Workday URL:
 
 ```bash
@@ -52,7 +102,7 @@ uv run pocket-agent fill 'https://COMPANY.wd5.myworkdayjobs.com/en-US/CAREER_SIT
 Use a real job URL from the employer and replace `~/.pocket-agent/resume.pdf` with your
 actual resume first. The filler reads the resume's email and uses it for both account
 email and username without prompting. The bundled sample resume is allowed for testing;
-missing or ambiguous email addresses stop account setup before registration. A standalone name, phone, GitHub, and LinkedIn
+an email missing from both sources, or ambiguous resume emails, stop account setup before registration. A standalone name, phone, GitHub, and LinkedIn
 from the resume override profile contact fields when recognized. Other structured
 facts still come from `profile.yaml`; this is not a complete resume-to-profile parser.
 To specify a password for new accounts, set `POCKET_AGENT_ACCOUNT_PASSWORD` in your
@@ -72,6 +122,16 @@ With account automation enabled, the recognized Workday registration consent che
 checked automatically. Other agreements, CAPTCHA, email verification, and MFA remain manual
 handoffs; press Enter in the terminal after completing the step. The adapter does not read your inbox or reset passwords.
 Final application submission remains manual.
+
+On Workday's **Autofill with Resume** step, the filler uploads the default
+`~/.pocket-agent/resume.pdf` (or `--resume PATH`), waits for upload/processing to
+finish and Next to become enabled, then advances to the next page. An upload
+failure stops navigation. The known Workday wizard Next control is treated as
+navigation even when its HTML type is `submit`; final-review controls remain blocked.
+On subsequent Workday pages, the recognized **Save and Continue** control advances
+automatically after required fields are populated and pass browser validation.
+The filler waits for the active step to change, reads the new page, and stops at
+Review instead of clicking a final submission control.
 
 Supported URL families are HTTPS employer subdomains of `myworkdayjobs.com` and recruiting
 paths on `myworkdaysite.com`. Redirects to another site stop credential entry. This adapter

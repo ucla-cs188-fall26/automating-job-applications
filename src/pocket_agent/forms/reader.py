@@ -28,6 +28,7 @@ _EXTRACT = r"""
   const heading = (el) => {
     let best = "";
     for (const node of document.querySelectorAll("h1,h2,h3,h4")) {
+      if (!visible(node)) continue;
       if (el.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_PRECEDING) best = textOf(node);
     }
     return best;
@@ -120,10 +121,11 @@ _EXTRACT = r"""
       input_type: "radio",
     });
   }
-  const controls = [...document.querySelectorAll("input, textarea, select, button[role=combobox]")];
+  const controls = [...document.querySelectorAll('input, textarea, select, button[role=combobox], button[aria-haspopup=listbox][name]')];
   for (const el of controls) {
     // Upload widgets often hide the real file input behind a visible drop zone.
-    const shown = visible(el) || (el.type === "file" && visible(el.parentElement));
+    const shown = visible(el) || (el.type === "file" && (
+      visible(el.parentElement) || visible(el.closest('[data-automation-id="file-upload-drop-zone"]'))));
     if (consumed.has(el) || !shown) continue;
     // react-select keeps a hidden "required" input next to its combobox. It is not a question.
     if (el.getAttribute("role") !== "combobox" && el.type !== "file" && el.closest(".select-shell, [class*='select__container']")) continue;
@@ -131,10 +133,18 @@ _EXTRACT = r"""
     if (type === "password") continue;
     // Honeypots (Workday's "beecatcher": "This input is for robots only") must stay empty.
     if (el.getAttribute("data-automation-id") === "beecatcher" || /for robots only|do not enter if you'?re human/i.test(labelFor(el))) continue;
-    if (["hidden", "submit", "button", "reset", "radio", "checkbox"].includes(type) && el.getAttribute("role") !== "combobox") {
+    if (["hidden", "submit", "button", "reset", "radio", "checkbox"].includes(type) && el.getAttribute("role") !== "combobox" && !(el.tagName === 'BUTTON' && el.name && el.getAttribute('aria-haspopup') === 'listbox')) {
       if (type !== "checkbox") continue;
     }
-    const label = labelFor(el) || (type === "file" ? heading(el) : "");
+    const workdayResume = type === "file" && /\.myworkday(?:jobs|site)\.com$/.test(location.hostname)
+      && /autofill with resume/i.test(document.body.innerText) && document.querySelectorAll('input[type=file]').length === 1;
+    const workday = /\.myworkday(?:jobs|site)\.com$/.test(location.hostname);
+    const workdaySelect = workday && el.tagName === 'BUTTON' && el.getAttribute('aria-haspopup') === 'listbox' && el.name;
+    let label = workdayResume ? "Resume" : (labelFor(el) || (type === "file" ? heading(el) : ""));
+    if (workdaySelect) {
+      const lab = el.id && document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      label = lab ? clean(textOf(lab)) : clean(label.replace(textOf(el), '').replace(/\brequired\b/ig, ''));
+    }
     const placeholder = el.getAttribute("placeholder") || "";
     let kind = "text";
     let options = [];
@@ -142,7 +152,17 @@ _EXTRACT = r"""
     const listbox = document.getElementById(el.getAttribute("aria-controls") || "");
     // Some selects (Eightfold) only build their listbox when opened; options are read when filling.
     const lazyList = el.tagName === "INPUT" && el.getAttribute("role") === "combobox" && !el.readOnly && !!el.getAttribute("aria-controls") && !(listbox && listbox.querySelector("[role=option]"));
-    if (el.getAttribute("role") === "combobox" && el.tagName === "INPUT" && el.getAttribute("aria-haspopup") === "dialog") {
+    if (workdaySelect) {
+      kind = 'workday_select';
+      value = /^(select one|select|choose one|choose)$/i.test(clean(textOf(el))) ? '' : clean(textOf(el));
+    } else if (workday && el.getAttribute('data-uxi-widget-type') === 'selectinput' && el.getAttribute('enterkeyhint') === 'search') {
+      kind = 'workday_prompt';
+      let parent = el.parentElement;
+      for (let level=0; parent && level<4; level++, parent=parent.parentElement) {
+        const selected = parent.querySelector('[role=listbox][aria-label*="selected" i]');
+        if (selected) { value = clean(textOf(selected)); break; }
+      }
+    } else if (el.getAttribute("role") === "combobox" && el.tagName === "INPUT" && el.getAttribute("aria-haspopup") === "dialog") {
       // A calendar picker that also accepts a typed date (Eightfold).
       kind = "date";
       value = el.value || "";
@@ -185,7 +205,7 @@ _EXTRACT = r"""
       order: spot.top * 1000 + spot.left,
       label,
       kind,
-      required: el.required || el.getAttribute("aria-required") === "true" || !!el.closest("[role=group][aria-required=true]") || marked.has(el),
+      required: el.required || el.getAttribute("aria-required") === "true" || !!el.closest("[role=group][aria-required=true]") || marked.has(el) || (workdaySelect && /\brequired\b/i.test(el.getAttribute('aria-label') || '')),
       options,
       placeholder,
       heading: heading(el),
@@ -196,7 +216,7 @@ _EXTRACT = r"""
   }
   const buttons = [];
   for (const button of document.querySelectorAll("button")) {
-    if (!visible(button) || button.getAttribute("role") === "combobox") continue;
+    if (!visible(button) || button.getAttribute("role") === "combobox" || (button.name && button.getAttribute('aria-haspopup') === 'listbox')) continue;
     buttons.push({
       uid: stamp(button),
       text: clean(textOf(button) || button.getAttribute("aria-label") || button.getAttribute("title") || ""),

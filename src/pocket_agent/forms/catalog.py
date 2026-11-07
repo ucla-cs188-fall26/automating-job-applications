@@ -308,7 +308,7 @@ def _forms() -> list[FormSpec]:
             )),
             StepSpec("Attestation", (
                 _text("signature", "Signature", expect="ask"),
-                _text("government_id", "Passport or government ID number", required=False, expect="ask"),
+                _text("government_id", "Passport or government ID number", required=False, expect="skip"),
             )),
         ), seed=37),
         FormSpec("wd-nimbus", "Nimbus Cartography", "workday", "heldout", (

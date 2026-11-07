@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,11 +14,11 @@ from pocket_agent.forms.match import indexed_key, match_label, section_of, sugge
 from pocket_agent.forms.memory import Memory
 from pocket_agent.forms.policy import ask_key, is_sensitive_key, question_for
 from pocket_agent.forms.reader import ExtractedField, PageSnapshot, extract_page
-from pocket_agent.forms.values import closest_option, date_part, date_variants, is_blank, present_value, resolve_option
+from pocket_agent.forms.values import closest_option, date_part, date_variants, equivalent, is_blank, present_value, resolve_option
 
 _INIT = """
 window.__pocketSubmits = 0;
-document.addEventListener("submit", event => { if (event.target.dataset.pocketAccount !== 'true') window.__pocketSubmits += 1; }, true);
+document.addEventListener("submit", event => { if (event.target.dataset.pocketAccount !== 'true' && event.target.dataset.pocketWizard !== 'true') window.__pocketSubmits += 1; }, true);
 """
 
 
@@ -25,7 +26,7 @@ _RESUME_INIT = """
 () => {
   if (window.__pocketSubmits !== undefined) return;
   window.__pocketSubmits = 0;
-  document.addEventListener("submit", event => { if (event.target.dataset.pocketAccount !== 'true') window.__pocketSubmits += 1; }, true);
+  document.addEventListener("submit", event => { if (event.target.dataset.pocketAccount !== 'true' && event.target.dataset.pocketWizard !== 'true') window.__pocketSubmits += 1; }, true);
 }
 """
 
@@ -34,6 +35,7 @@ _RESUME_INIT = """
 class UserAnswer:
     value: str
     always_use: bool = False
+    skip: bool = False
 
 
 @dataclass
@@ -68,6 +70,8 @@ class FormRun:
     gate: str = ""
     model_calls: int = 0
     model_seconds: float = 0.0
+    current_step: str = ""
+    status: str = "stopped"
 
 
 def fill_form(page, url: str, memory: Memory, resume_path: Path | None, ask: AskFn, llm=None, *, resume: bool = False) -> FormRun:
@@ -92,6 +96,18 @@ def fill_form(page, url: str, memory: Memory, resume_path: Path | None, ask: Ask
             if snap.gate:
                 run.gate = snap.gate
                 break
+            if _workday_resume_step(page):
+                try:
+                    _upload_workday_resume(page, memory, resume_path)
+                    run.outcomes.append(FieldOutcome("Resume", "", 0, "resume", "fill", "uploaded", False, True))
+                    if not _advance(page, extract_page(page)):
+                        run.error = "Resume uploaded, but Workday did not advance from the upload step."
+                        break
+                    _wait_ready(page)
+                except Exception as exc:
+                    run.error = f"Workday resume upload stopped ({type(exc).__name__}); no next-page click was sent."
+                    break
+                continue
             if _grow_work(page, memory, snap):
                 continue
             # _grow_work re-reads the page, which re-stamps every uid. If the page re-rendered meanwhile
@@ -105,9 +121,25 @@ def fill_form(page, url: str, memory: Memory, resume_path: Path | None, ask: Ask
                     outcome = _outcome(field, None, "error", type(exc).__name__, asked=False, from_memory=False)
                 handled.add((field.section, field.label.casefold(), field.group))
                 run.outcomes.append(outcome)
+                if field.kind == "file" and outcome.action == "error":
+                    run.error = "Resume upload did not complete; stopped before advancing."
+                    break
                 continue
             if not _advance(page, snap):
+                from pocket_agent.forms.workday import account_scope
+                if account_scope(page.url) and snap.progress and not progress_is_last(snap.progress) and not re.search(r"\breview\b", snap.progress, re.I):
+                    missing = [field.label for field in snap.fields if field.required and is_blank(field.value)]
+                    run.error = "Workday did not advance from the current step" + (": " + ", ".join(missing) if missing else "; check validation or navigation errors")
                 break
+            handled.clear()
+            from pocket_agent.forms.workday import account_scope
+            if account_scope(page.url):
+                _wait_ready(page)
+        else:
+            run.error = "Stopped after reaching the action limit; application is incomplete."
+        final_snapshot = extract_page(page)
+        run.current_step = final_snapshot.progress
+        run.status = "review" if progress_is_last(final_snapshot.progress) or re.search(r"\breview\b", final_snapshot.progress, re.I) else "blocked" if run.gate or run.error else "stopped"
         run.submits = int(page.evaluate("() => window.__pocketSubmits || 0") or 0)
         if "/submitted" in page.url:
             run.submits = max(run.submits, 1)
@@ -141,6 +173,8 @@ def _wait_ready(page, settle_ms: int = 12000) -> PageSnapshot:
 
 
 def _ready(snap: PageSnapshot) -> bool:
+    if progress_is_last(snap.progress) or re.search(r"\breview\b", snap.progress, re.I):
+        return True
     if snap.fields or snap.gate:
         return True
     return any(classify_button(button.text, button_type=button.button_type, onclick=button.onclick) in {"forward", "add"} for button in snap.buttons)
@@ -245,14 +279,17 @@ def _decide_and_write(page, field: ExtractedField, memory: Memory, resume_path, 
         # Boards parse the upload and overwrite name, email, and phone with what it says. Never send someone else's resume.
         return _outcome(field, "resume", "skip", "", asked=False, from_memory=False)
     if forced:
+        entry = memory.get(forced)
+        # Optional disclosures/preferences must not become blocking questions.
+        # Only an explicitly reusable answer justifies changing these fields.
+        if not field.required and not (entry and entry.always_use and entry.value.strip()):
+            return _outcome(field, forced, "skip", field.value, asked=False, from_memory=False)
         return _ask_or_saved(page, field, memory, resume_path, ask, forced)
     confirmed = _name_confirmation(page, field, memory, snapshot)
     if confirmed:
         written = _write(page, field, confirmed, resume_path)
         if written:
             return _outcome(field, "full_name_confirmation", "fill", written, asked=False, from_memory=True)
-    if field.kind == "checkbox" and not field.required and ask_key(field.label, field.section):
-        return _outcome(field, None, "skip", "", asked=False, from_memory=False)
     learned = memory.learned_labels()
     match = match_label(field.label, section=field.section, learned=learned)
     base = match.key if match and match.score >= 0.93 and not is_sensitive_key(match.key) else None
@@ -272,11 +309,13 @@ def _decide_and_write(page, field: ExtractedField, memory: Memory, resume_path, 
             return _outcome(field, key, "fill", written, asked=False, from_memory=True, via_model=agreed)
         if field.required:
             return _ask_or_saved(page, field, memory, resume_path, ask, key or _label_key(field))
+    if field.value and not is_blank(field.value):
+        return _outcome(field, key, "keep", field.value, asked=False, from_memory=False)
     if field.required:
         return _ask_or_saved(page, field, memory, resume_path, ask, key or _label_key(field))
-    if field.value and not is_blank(field.value):
-        _clear_field(page, field)
-    return _outcome(field, key, "skip", "", asked=False, from_memory=False)
+    # Unknown optional fields may already contain resume-parsed or user-entered
+    # values. Leaving them alone is safer than erasing them.
+    return _outcome(field, key, "skip", field.value, asked=False, from_memory=False)
 
 
 def _label_key(field: ExtractedField) -> str:
@@ -287,6 +326,11 @@ def _label_key(field: ExtractedField) -> str:
 
 def _ask_or_saved(page, field, memory, resume_path, ask, key: str) -> FieldOutcome:
     entry = memory.get(key)
+    if entry and entry.source.startswith("profile_exact:"):
+        normalize = lambda text: " ".join(text.replace('*', '').split()).strip().casefold()
+        fingerprint = hashlib.sha256(normalize(field.label).encode()).hexdigest()
+        if entry.source != "profile_exact:" + fingerprint:
+            entry = None
     sensitive = is_sensitive_key(key) or ask_key(field.label, field.section) == key
     if entry and entry.always_use and entry.value.strip():
         written = _write(page, field, entry.value, resume_path)
@@ -298,6 +342,8 @@ def _ask_or_saved(page, field, memory, resume_path, ask, key: str) -> FieldOutco
         if 0 < len(offered) <= 15:
             question += " Options: " + " / ".join(offered)
     answer = ask(Asked(key, field.label, question))
+    if answer.skip:
+        return _outcome(field, key, "skip", "", asked=False, from_memory=False)
     memory.put(
         key,
         answer.value,
@@ -376,11 +422,52 @@ def _llm_fill(field: ExtractedField, memory: Memory, llm) -> str | None:
 
 def _write(page, field: ExtractedField, raw: str, resume_path: Path | None) -> str:
     options = [option["label"] for option in field.options]
+    if field.kind == "workday_prompt":
+        root = page.locator(f'[data-pocket-uid="{field.uid}"]')
+        if equivalent(_read_back(page, field), raw):
+            return _read_back(page, field)
+        root.fill("")
+        root.press_sequentially(raw, delay=25)
+        root.press("Enter")
+        try:
+            page.wait_for_function("""({uid, value}) => {
+                const el = document.querySelector(`[data-pocket-uid="${uid}"]`);
+                if (!el || el.value) return false;
+                let parent=el.parentElement;
+                for(let i=0; parent&&i<4; i++,parent=parent.parentElement){
+                    const selected=parent.querySelector('[role=listbox][aria-label*="selected" i]');
+                    if(selected && selected.innerText.toLowerCase().includes(value.toLowerCase()))return true;
+                }
+                return false;
+            }""", arg={"uid": field.uid, "value": raw}, timeout=8000)
+        except Exception:
+            return ""
+        return _read_back(page, field)
+    if field.kind == "workday_select":
+        root = page.locator(f'[data-pocket-uid="{field.uid}"]')
+        if equivalent(root.inner_text(), raw):
+            return root.inner_text().strip()
+        root.click()
+        choices = page.get_by_role("option")
+        try:
+            choices.first.wait_for(state="visible", timeout=8000)
+        except Exception:
+            return ""
+        labels = choices.all_inner_texts()
+        choice = resolve_option(raw, labels)
+        if not choice:
+            root.press("Escape")
+            return ""
+        choices.nth(labels.index(choice)).click()
+        return root.inner_text().strip() if equivalent(root.inner_text(), choice) else ""
     if field.kind == "file":
         if resume_path is None:
             return ""
         page.locator(f'[data-pocket-uid="{field.uid}"]').set_input_files(str(resume_path))
         _settle_upload(page, field.uid)
+        from pocket_agent.forms.workday import account_scope
+        if account_scope(page.url) and re.search(r"autofill with resume", page.locator("body").inner_text(), re.I):
+            _wait_workday_upload(page, Path(resume_path).name)
         return "uploaded"
     part = date_part(field.label, raw, named=field.kind in {"dropdown", "select", "combobox"})
     if part:
@@ -445,7 +532,53 @@ def _settle_upload(page, uid: str) -> None:
         if not page.evaluate(_UPLOAD_BUSY, uid):
             break
         page.wait_for_timeout(250)
+    else:
+        raise TimeoutError("Resume upload is still processing")
     page.wait_for_timeout(300)
+
+
+def _wait_workday_upload(page, filename: str) -> None:
+    """Do not click Next while Workday is still receiving or parsing the PDF."""
+    page.wait_for_function("""filename => {
+        const shown = el => !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+        const text = document.body.innerText;
+        const busy = [...document.querySelectorAll('[aria-busy=true], [role=progressbar]')].some(shown)
+          || /uploading|processing (?:your )?(?:resume|file)|parsing (?:your )?resume/i.test(text);
+        const error = [...document.querySelectorAll('[role=alert], [data-automation-id*=error i]')]
+          .some(el => shown(el) && /failed|unable|invalid|unsupported|too large|error/i.test(el.innerText));
+        const next = document.querySelector('[data-automation-id="bottom-navigation-next-button"], [data-automation-id="pageFooterNextButton"]');
+        const ready = !next || (!next.disabled && next.getAttribute('aria-disabled') !== 'true');
+        const uploaded = /successfully uploaded|uploaded successfully/i.test(text);
+        return !busy && !error && ready && uploaded && text.includes(filename);
+    }""", arg=filename, timeout=30000)
+
+
+def _workday_resume_step(page) -> bool:
+    from pocket_agent.forms.workday import account_scope
+    return bool(account_scope(page.url)) and bool(page.evaluate("""() =>
+        [...document.querySelectorAll('h1,h2,h3,[data-automation-id=progressBarActiveStep]')]
+        .some(el => el.getClientRects().length && /autofill with resume/i.test(el.innerText))
+    """))
+
+
+def _upload_workday_resume(page, memory: Memory, resume_path: Path | None) -> None:
+    if resume_path is None or not Path(resume_path).is_file():
+        raise FileNotFoundError("No resume PDF configured")
+    if not resume_names_user(Path(resume_path), memory):
+        raise ValueError("Resume name does not match the profile")
+    filename = Path(resume_path).name
+    # A previous run may already have uploaded the PDF. Do not upload it twice.
+    text = page.locator('body').inner_text()
+    if filename in text and re.search(r"successfully uploaded|uploaded successfully", text, re.I):
+        _wait_workday_upload(page, filename)
+        return
+    target = page.locator('input[type=file][data-automation-id="file-upload-input-ref"]')
+    # Older layouts have an unmarked hidden input beside the drop zone.
+    if not target.count() and page.locator('input[type=file]').count() == 1:
+        target = page.locator('input[type=file]')
+    target.wait_for(state="attached", timeout=45000)
+    target.set_input_files(str(resume_path))
+    _wait_workday_upload(page, filename)
 
 
 _NEARBY_OPTIONS = r"""
@@ -663,6 +796,17 @@ def _clear_field(page, field: ExtractedField) -> None:
 
 
 def _read_back(page, field: ExtractedField) -> str:
+    if field.kind == "workday_select":
+        return page.locator(f'[data-pocket-uid="{field.uid}"]').inner_text().strip()
+    if field.kind == "workday_prompt":
+        return page.locator(f'[data-pocket-uid="{field.uid}"]').evaluate("""el => {
+            let parent=el.parentElement;
+            for(let i=0; parent&&i<4; i++,parent=parent.parentElement){
+                const selected=parent.querySelector('[role=listbox][aria-label*="selected" i]');
+                if(selected)return selected.innerText.trim();
+            }
+            return '';
+        }""")
     if field.kind == "radio":
         for option in field.options:
             if option["uid"] and page.locator(f'[data-pocket-uid="{option["uid"]}"]').is_checked():
@@ -707,6 +851,58 @@ def _advance(page, snap: PageSnapshot) -> bool:
         return False
     forwards = []
     for button in snap.buttons:
+        # Workday's wizard navigation is type=submit on intermediate pages too.
+        target = page.locator(f'[data-pocket-uid="{button.uid}"]')
+        from pocket_agent.forms.workday import account_scope
+        workday_next = (
+            account_scope(page.url)
+            and (_workday_resume_step(page) or bool(snap.progress))
+            and not re.search(r"\breview\b", snap.progress, re.I)
+            and not re.search(r"\breview\b", button.heading, re.I)
+            and button.text.casefold() in {"next", "continue", "save and continue"}
+            and target.get_attribute("data-automation-id") in {"bottom-navigation-next-button", "pageFooterNextButton"}
+        )
+        if workday_next:
+            upload_step = _workday_resume_step(page)
+            attached = not upload_step or any(field.kind == "file" and field.value == "uploaded" for field in snap.fields) or bool(
+                re.search(r"\S+\.pdf\b", page.locator("body").inner_text(), re.I)
+            )
+            if any(field.required and is_blank(field.value) for field in snap.fields):
+                return False
+            if page.locator('input:invalid, select:invalid, textarea:invalid, [aria-invalid=true]').count():
+                return False
+            if attached and target.is_enabled():
+                if target.get_attribute("aria-hidden") == "true":
+                    overlay = page.locator('[data-automation-id="click_filter"]').and_(
+                        page.get_by_role("button", name=button.text, exact=True)
+                    )
+                    if overlay.count() != 1 or not overlay.is_visible():
+                        return False
+                    target = overlay
+                target.evaluate("el => {const form = el.closest('form'); if (form) form.dataset.pocketWizard='true';}")
+                try:
+                    target.click(timeout=8000)
+                    if upload_step:
+                        page.wait_for_function("""() => [...document.querySelectorAll('h1,h2,h3')]
+                            .some(el => el.getClientRects().length && /^my information$/i.test(el.innerText.trim()))""", timeout=30000)
+                    else:
+                        page.wait_for_function(r"""before => {
+                            const step = document.querySelector('[data-automation-id=progressBarActiveStep], #progress');
+                            const normalize = text => text.replace(/\s+/g,' ').trim();
+                            const current = step && normalize(step.innerText);
+                            if (!current || current === normalize(before)) return false;
+                            const title = current.replace(/^current step \d+ of \d+\s*/i,'').toLowerCase();
+                            return [...document.querySelectorAll('h1,h2,h3')].some(el => {
+                                const heading=normalize(el.innerText).toLowerCase();
+                                return el.getClientRects().length && heading && (heading===title || title.startsWith(heading+' '));
+                            });
+                        }""", arg=snap.progress, timeout=30000)
+                    return True
+                except Exception:
+                    return False
+                finally:
+                    page.locator('form[data-pocket-wizard]').evaluate_all("forms=>forms.forEach(form=>delete form.dataset.pocketWizard)")
+            continue
         kind = classify_button(
             button.text,
             button_type=button.button_type,

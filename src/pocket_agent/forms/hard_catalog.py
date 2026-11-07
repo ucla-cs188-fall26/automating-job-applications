@@ -193,7 +193,7 @@ def hard_forms() -> tuple[FormSpec, ...]:
             StepSpec("Application questions", (
                 _t("essay", "Why do you want to work here?", kind="textarea", expect="ask"),
                 _t("essay", "What engineering work excites you?", kind="textarea", expect="ask"),
-                _t("cover_letter", "Additional information", kind="textarea", required=False, expect="ask"),
+                _t("cover_letter", "Additional information", kind="textarea", required=False, expect="skip"),
             )),
             StepSpec("Review", (
                 _t("signature", "Type your full legal name as your electronic signature", expect="ask"),

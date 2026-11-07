@@ -6,6 +6,9 @@ import re
 
 # (pattern, canonical key). First match wins. Patterns are general, not form ids.
 SENSITIVE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bnon[ -]?compete\b", re.I), "non_compete"),
+    (re.compile(r"\bfamily members?\b.*\b(?:work|employed)\b.*\bzebra\b", re.I), "company.zebra.family_members"),
+    (re.compile(r"\bpermanent residen(?:ce|cy) or citizenship\b.*\banother country\b", re.I), "other_residency_or_citizenship"),
     (re.compile(r"\b(gender|sex)\b", re.I), "gender"),
     (re.compile(r"\b(hispanic|latino)\b", re.I), "hispanic"),
     (re.compile(r"\b(race|ethnicity)\b", re.I), "race"),

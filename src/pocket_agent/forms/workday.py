@@ -109,7 +109,9 @@ class WorkdayAccounts:
             try:
                 page.wait_for_function("""() => {
                     const passwords = [...document.querySelectorAll('input[type=password]')].filter(el => el.getClientRects().length);
-                    return !passwords.length || /verify your|verification|check your (email|inbox)|already (exists|registered|in use)|account exists|invalid|incorrect|unable|error/i.test(document.body.innerText);
+                    const application = [...document.querySelectorAll('h1,h2,h3')].some(el =>
+                        el.getClientRects().length && /^(application|autofill with resume|my information|my experience|application questions)/i.test(el.innerText.trim()));
+                    return (!passwords.length && application) || /verify your|verification|check your (email|inbox)|already (exists|registered|in use)|account exists|invalid|incorrect|unable|error/i.test(document.body.innerText);
                 }""", timeout=15000)
                 return True
             except Exception:
@@ -135,7 +137,7 @@ class WorkdayAccounts:
         if len(decline) == 1:
             decline[0].click(timeout=8000)
         if not self.email:
-            return AccountStep(message="No email address was found in your resume. Add your email to the resume before creating an account.")
+            return AccountStep(message="No email address was found in your resume or personal profile. Add it to either source before creating an account.")
         # Verification is completed by the user in the browser.
         body = page.locator("body").inner_text().casefold()
         if re.search(r"verify your (?:email|account)|verification (?:code|email)|check your (?:email|inbox)|one.time (?:code|password)|two.factor", body):

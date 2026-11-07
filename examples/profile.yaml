@@ -1,4 +1,13 @@
 schema_version: 1
+personal:
+  # Fallback facts absent from the resume. Fill these with your own details.
+  address_line_1: ""
+  address_line_2: ""
+  city: ""
+  region: ""
+  postal_code: ""
+  county: ""
+  country: ""
 canary: POCKET-AGENT-CANARY-7f3a
 name: Jordan Hale
 email: jordan.hale@example.com

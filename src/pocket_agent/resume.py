@@ -15,13 +15,19 @@ def resume_contact_profile(profile: dict, path: Path) -> dict:
     if not parsed.get("ok"):
         raise ValueError(parsed.get("error", "Could not read resume"))
     result = deepcopy(profile)
+    personal = profile.get("personal") or {}
+    for key in ("name", "email", "phone"):
+        if personal.get(key):
+            result[key] = personal[key]
+    for key in ("city", "region", "country", "postal_code", "county", "address_line_1", "address_line_2"):
+        if personal.get(key):
+            result.setdefault("location", {})[key] = personal[key]
     emails = list(dict.fromkeys(parsed["emails"]))
     if len(emails) == 1:
         result["email"] = emails[0]
     elif len(emails) > 1:
         raise ValueError("Resume has multiple email addresses; use a resume with one application contact email.")
-    else:
-        result["email"] = ""  # Never substitute an unrelated profile email for a missing resume contact.
+    # Missing facts retain the explicit personal/profile fallback.
     lines = parsed["lines"]
     if lines:
         name = lines[0].strip()
