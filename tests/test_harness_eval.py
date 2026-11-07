@@ -255,3 +255,31 @@ def test_synthetic_profiles_are_fictional() -> None:
         assert "555" in row["phone"]
         assert row["fictional"] is True
         assert row["constraints"]["salary_expectation"] is None
+
+
+def test_profile_read_before_premature_ask(home: Path) -> None:
+    profile = Path("examples/profile.yaml").read_text(encoding="utf-8")
+    (home / "profile.yaml").write_text(profile, encoding="utf-8")
+    for action in (
+        {"action": "ask_user", "question": "Graduation date?", "missing_fields": ["graduation_date"]},
+        {"action": "tool", "tool": "ask_user", "arguments": {
+            "question": "Graduation date?", "missing_fields": ["graduation_date"]}},
+    ):
+        backend = MockBackend([
+            json.dumps(action),
+            json.dumps({"action": "final", "answer": "May 2026"}),
+        ])
+        result = run_agent("What is my graduation date?", backend, ToolContext(home=home, network=False), model="mock")
+        assert result.ask_user is None
+        assert result.final == "May 2026"
+        assert [call["name"] for call in result.tools] == ["profile_get"]
+        assert result.tools[0]["result"]["profile"]["education"][0]["graduation"] == "2026-05"
+
+
+def test_missing_graduation_can_still_ask_after_profile_read(home: Path) -> None:
+    profile = Path("examples/profile.yaml").read_text(encoding="utf-8").replace('    graduation: "2026-05"\n', '')
+    (home / "profile.yaml").write_text(profile, encoding="utf-8")
+    ask = json.dumps({"action": "ask_user", "question": "Graduation date?", "missing_fields": ["graduation_date"]})
+    result = run_agent("What is my graduation date?", MockBackend([ask, ask]), ToolContext(home=home, network=False), model="mock")
+    assert result.ask_user["missing_fields"] == ["graduation_date"]
+    assert len(result.tools) == 1
