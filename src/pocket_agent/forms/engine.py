@@ -17,7 +17,7 @@ from pocket_agent.forms.values import closest_option, date_part, date_variants, 
 
 _INIT = """
 window.__pocketSubmits = 0;
-document.addEventListener("submit", () => { window.__pocketSubmits += 1; }, true);
+document.addEventListener("submit", event => { if (event.target.dataset.pocketAccount !== 'true') window.__pocketSubmits += 1; }, true);
 """
 
 
@@ -25,7 +25,7 @@ _RESUME_INIT = """
 () => {
   if (window.__pocketSubmits !== undefined) return;
   window.__pocketSubmits = 0;
-  document.addEventListener("submit", () => { window.__pocketSubmits += 1; }, true);
+  document.addEventListener("submit", event => { if (event.target.dataset.pocketAccount !== 'true') window.__pocketSubmits += 1; }, true);
 }
 """
 
@@ -100,7 +100,7 @@ def fill_form(page, url: str, memory: Memory, resume_path: Path | None, ask: Ask
             field = _next_field(snap, handled)
             if field is not None:
                 try:
-                    outcome = _decide_and_write(page, field, memory, resume_path, ask, llm, run)
+                    outcome = _decide_and_write(page, field, memory, resume_path, ask, llm, run, snapshot=snap)
                 except Exception as exc:  # noqa: BLE001 — one stuck widget should not end the whole page
                     outcome = _outcome(field, None, "error", type(exc).__name__, asked=False, from_memory=False)
                 handled.add((field.section, field.label.casefold(), field.group))
@@ -209,7 +209,34 @@ def _next_field(snap: PageSnapshot, handled: set[tuple[str, str, int]]) -> Extra
     return files[0] if files else (pending[0] if pending else None)
 
 
-def _decide_and_write(page, field: ExtractedField, memory: Memory, resume_path, ask: AskFn, llm, run: FormRun) -> FieldOutcome:
+def _name_confirmation(page, field: ExtractedField, memory: Memory, snapshot: PageSnapshot | None) -> str | None:
+    """Confirm only an entered name matching the profile, not a general attestation."""
+    label = field.label.casefold()
+    if not re.match(r"^have you (?:added|entered|provided) your full legal name\b", label):
+        return None
+    if ask_key(field.label, field.section):
+        return None
+    expected = memory.get("full_name")
+    if not expected or not expected.value.strip() or snapshot is None:
+        return None
+    normalize = lambda value: " ".join(value.split()).casefold()
+    names: dict[str, list[str]] = {}
+    for candidate in snapshot.fields:
+        if candidate.uid == field.uid or candidate.kind != "text":
+            continue
+        matched = match_label(candidate.label, section=candidate.section)
+        if matched and matched.key in {"full_name", "first_name", "last_name"}:
+            names.setdefault(matched.key, []).append(_read_back(page, candidate))
+    target = normalize(expected.value)
+    if len(names.get("full_name", [])) == 1 and normalize(names["full_name"][0]) == target:
+        return "Yes"
+    if len(names.get("first_name", [])) == len(names.get("last_name", [])) == 1:
+        if normalize(names["first_name"][0] + " " + names["last_name"][0]) == target:
+            return "Yes"
+    return None
+
+
+def _decide_and_write(page, field: ExtractedField, memory: Memory, resume_path, ask: AskFn, llm, run: FormRun, *, snapshot: PageSnapshot | None = None) -> FieldOutcome:
     forced = ask_key(field.label, field.section)
     if field.kind == "file" and forced == "cover_letter":
         # The only file we have is the resume. It does not go in a cover letter slot.
@@ -219,6 +246,11 @@ def _decide_and_write(page, field: ExtractedField, memory: Memory, resume_path, 
         return _outcome(field, "resume", "skip", "", asked=False, from_memory=False)
     if forced:
         return _ask_or_saved(page, field, memory, resume_path, ask, forced)
+    confirmed = _name_confirmation(page, field, memory, snapshot)
+    if confirmed:
+        written = _write(page, field, confirmed, resume_path)
+        if written:
+            return _outcome(field, "full_name_confirmation", "fill", written, asked=False, from_memory=True)
     if field.kind == "checkbox" and not field.required and ask_key(field.label, field.section):
         return _outcome(field, None, "skip", "", asked=False, from_memory=False)
     learned = memory.learned_labels()

@@ -216,6 +216,7 @@ _EXTRACT = r"""
   // A challenge drawn in a visible iframe never shows up in body text. A hidden invisible-mode badge is not a challenge.
   const challenge = [...document.querySelectorAll("iframe")].some((frame) => /captcha|challenges\.cloudflare/i.test((frame.src || "") + " " + (frame.title || "")) && visible(frame) && frame.getBoundingClientRect().width > 60 && frame.getBoundingClientRect().height > 60);
   if (challenge || /captcha|i'm not a robot|i am not a robot|verify you are human/.test(blob)) gate = "captcha";
+  else if (/verify your (email|account)|verification (code|email)|check your (email|inbox)|one.time (code|password)|two.factor/.test(blob)) gate = "verification";
   else if (document.querySelector('input[type="password"]') || /create an account|create your account|sign in to apply|account already exists|already have an account/.test(blob)) gate = "login";
   // A modal asking the user to agree (Eightfold's "Data Privacy Agreement" after a resume upload) blocks every
   // click behind it. Agreeing is the user's call, and its buttons are type=submit, so hand the browser over.

@@ -13,6 +13,8 @@ education:
   - school: Northwind University
     degree: BS
     field: Computer Science
+    # Optional: add your actual enrollment month to fill "Start date year/month".
+    # start: "2022-09"
     graduation: "2026-05"
     gpa: 3.6
 citizenship:

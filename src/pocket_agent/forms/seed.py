@@ -91,6 +91,9 @@ def seed_memory(memory: Memory, profile: dict[str, Any], *, resume_path: str = "
     _put(memory, "field", str(education.get("field") or ""))
     _put(memory, "graduation", str(education.get("graduation") or ""))
     _put(memory, "gpa", str(education.get("gpa") or ""))
+    for index, school in enumerate(profile.get("education") or []):
+        _put(memory, f"education.{index}.start", str(school.get("start") or ""))
+        _put(memory, f"education.{index}.end", str(school.get("end") or school.get("graduation") or ""))
     for index, job in enumerate(profile.get("experience") or []):
         _put(memory, f"work.{index}.title", str(job.get("title") or ""))
         _put(memory, f"work.{index}.org", str(job.get("org") or ""))

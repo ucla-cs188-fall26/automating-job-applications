@@ -214,6 +214,7 @@ _SECTION = {
     "field": "education",
     "gpa": "education",
     "graduation": "education",
+    "education.start": "education",
 }
 
 FUZZY_MIN = 0.93
@@ -322,8 +323,7 @@ def date_part_key(label: str, section: str) -> str | None:
     if section == "work":
         return f"work.{which}"
     if section == "education":
-        # The profile keeps a graduation date, not a start date.
-        return "graduation" if which == "end" else f"education_start_{part}"
+        return "graduation" if which == "end" else "education.start"
     return None
 
 
@@ -371,10 +371,12 @@ def suggestions(label: str, section: str = "", limit: int = 5) -> list[tuple[str
 
 
 def indexed_key(base: str, group: int) -> str:
+    if base == "graduation" and group:
+        return f"education.{group}.end"
     if base.startswith("work."):
         field = base.split(".", 1)[1]
         return f"work.{group}.{field}"
-    if base.startswith("education.") and group:
+    if base.startswith("education."):
         field = base.split(".", 1)[1]
         return f"education.{group}.{field}"
     return base

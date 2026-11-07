@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -150,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     fill.add_argument("url")
     fill.add_argument("--model", default="0.6b", choices=["none", "0.6b", "1.7b", "4b"])
     fill.add_argument("--resume", type=Path)
+    fill.add_argument("--workday-accounts", action="store_true", help="Create/sign in to Workday accounts using macOS Keychain")
     fill.set_defaults(func=cmd_fill)
 
     eval_forms = sub.add_parser("eval-forms", help="Score the local fictional application suite")
@@ -479,6 +481,33 @@ def cmd_fill(args: argparse.Namespace) -> int:
         return 1
     profile = load_profile(profile_path)
     resume = args.resume or (home / "resume.pdf")
+    if resume.exists():
+        from pocket_agent.resume import resume_contact_profile
+        try:
+            profile = resume_contact_profile(profile, resume)
+        except Exception:
+            print("Could not extract resume contacts. Check that your resume is readable and contains one email address.")
+            return 1
+    accounts = None
+    if args.workday_accounts:
+        from getpass import getpass
+        from pocket_agent.forms.workday import KeychainCredentials, WorkdayAccounts, account_scope
+
+        if not resume.exists():
+            print("Workday account creation needs your resume at ~/.pocket-agent/resume.pdf or --resume PATH.")
+            return 1
+        email = str(profile.get("email") or "")
+        if not email:
+            print("No email was found in the resume. Add your email to the resume and retry.")
+            return 1
+        if not account_scope(args.url):
+            print("--workday-accounts requires an HTTPS Workday career-site URL.")
+            return 1
+        try:
+            accounts = WorkdayAccounts(args.url, str(profile.get("email") or ""), KeychainCredentials(), getpass, default_password=os.environ.get("POCKET_AGENT_ACCOUNT_PASSWORD"))
+        except RuntimeError as exc:
+            print(str(exc))
+            return 1
     memory = Memory(home / "forms.sqlite")
     seed_memory(memory, profile, resume_path=str(resume) if resume.exists() else "")
     decider = None if args.model == "none" else LocalDecider(args.model)
@@ -499,10 +528,26 @@ def cmd_fill(args: argparse.Namespace) -> int:
         page = browser.new_page()
         resume_file = resume if resume.exists() else None
         runs = [fill_form(page, args.url, memory, resume_file, ask, decider)]
-        # At a gate the browser is handed to the user; pocket-agent never signs in, clicks Apply, or solves a CAPTCHA.
-        while runs[-1].gate and not runs[-1].error and not runs[-1].submits and len(runs) <= 6:
-            print(_GATE_HELP.get(runs[-1].gate, f"Stopped at a {runs[-1].gate} page."))
-            print("When the application form is showing, press Enter here to continue (or type q to stop).")
+        # The opt-in adapter handles only recognized Workday account controls.
+        while runs[-1].gate and not runs[-1].error and not runs[-1].submits and len(runs) <= 20:
+            account_message = False
+            if accounts is not None:
+                try:
+                    step = accounts.step(page, runs[-1].gate)
+                except Exception as exc:
+                    # Never print exceptions that might include account field values.
+                    print(f"Workday account handling failed ({type(exc).__name__}). Complete this step in the browser.")
+                    account_message = True
+                else:
+                    if step.message:
+                        print(step.message)
+                        account_message = True
+                    if step.progressed:
+                        runs.append(fill_form(page, args.url, memory, resume_file, ask, decider, resume=True))
+                        continue
+            if not account_message:
+                print(_GATE_HELP.get(runs[-1].gate, f"Stopped at a {runs[-1].gate} page."))
+            print("After completing the indicated step, press Enter to continue (or type q to stop).")
             try:
                 if input("> ").strip().lower() in {"q", "quit", "stop"}:
                     break
@@ -538,8 +583,9 @@ def cmd_eval_forms(args: argparse.Namespace) -> int:
 
 _GATE_HELP = {
     "start": "This is the job posting, not the form. In the browser window, click Apply yourself (on Workday, then 'Apply Manually').",
-    "login": "This site wants you to sign in or create an account. Do that yourself in the browser window; pocket-agent never types passwords or creates accounts.",
+    "login": "Complete this account step in the browser window. Workday account automation is available with --workday-accounts; other login flows are manual.",
     "captcha": "The site is showing a CAPTCHA. Solve it yourself in the browser window.",
+    "verification": "Complete email verification or two-factor authentication in the browser window.",
     "consent": "The site is asking you to agree to something (for example a data privacy agreement after the resume upload). Read it and click Agree or Cancel yourself in the browser window.",
 }
 
