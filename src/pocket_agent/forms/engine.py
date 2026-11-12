@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+import hashlib
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -11,11 +14,20 @@ from pocket_agent.forms.match import indexed_key, match_label, section_of, sugge
 from pocket_agent.forms.memory import Memory
 from pocket_agent.forms.policy import ask_key, is_sensitive_key, question_for
 from pocket_agent.forms.reader import ExtractedField, PageSnapshot, extract_page
-from pocket_agent.forms.values import date_variants, is_blank, present_value
+from pocket_agent.forms.values import closest_option, date_part, date_variants, equivalent, is_blank, present_value, resolve_option
 
 _INIT = """
 window.__pocketSubmits = 0;
-document.addEventListener("submit", () => { window.__pocketSubmits += 1; }, true);
+document.addEventListener("submit", event => { if (event.target.dataset.pocketAccount !== 'true' && event.target.dataset.pocketWizard !== 'true') window.__pocketSubmits += 1; }, true);
+"""
+
+
+_RESUME_INIT = """
+() => {
+  if (window.__pocketSubmits !== undefined) return;
+  window.__pocketSubmits = 0;
+  document.addEventListener("submit", event => { if (event.target.dataset.pocketAccount !== 'true' && event.target.dataset.pocketWizard !== 'true') window.__pocketSubmits += 1; }, true);
+}
 """
 
 
@@ -23,6 +35,7 @@ document.addEventListener("submit", () => { window.__pocketSubmits += 1; }, true
 class UserAnswer:
     value: str
     always_use: bool = False
+    skip: bool = False
 
 
 @dataclass
@@ -30,14 +43,9 @@ class Asked:
     key: str
     label: str
     question: str
-    kind: str = "text"
-    options: tuple[str, ...] = ()
-    sensitive: bool = False
-    section: str = ""
 
 
 AskFn = Callable[[Asked], UserAnswer]
-EventFn = Callable[[dict], None]
 
 
 @dataclass
@@ -62,27 +70,22 @@ class FormRun:
     gate: str = ""
     model_calls: int = 0
     model_seconds: float = 0.0
+    current_step: str = ""
+    status: str = "stopped"
 
 
-def fill_form(
-    page,
-    url: str,
-    memory: Memory,
-    resume_path: Path | None,
-    ask: AskFn,
-    llm=None,
-    *,
-    events: EventFn | None = None,
-    navigate: bool = True,
-) -> FormRun:
+def fill_form(page, url: str, memory: Memory, resume_path: Path | None, ask: AskFn, llm=None, *, resume: bool = False) -> FormRun:
+    """resume=True fills the page already open (after the user signed in by hand) instead of loading url."""
     run = FormRun(url=url)
     try:
         page.set_default_timeout(8000)
-        if navigate:
+        if not resume:
             page.add_init_script(_INIT)
             page.goto(url, wait_until="domcontentloaded")
+        else:
+            # The init script already counts submits on pages loaded since the first run; cover a page that predates it.
+            page.evaluate(_RESUME_INIT)
         handled: set[tuple[str, str, int]] = set()
-        heading = ""
         for step_index in range(48):
             snap = _wait_ready(page) if step_index == 0 else extract_page(page)
             if snap.gate:
@@ -93,76 +96,88 @@ def fill_form(
             if snap.gate:
                 run.gate = snap.gate
                 break
+            if _workday_resume_step(page):
+                try:
+                    _upload_workday_resume(page, memory, resume_path)
+                    run.outcomes.append(FieldOutcome("Resume", "", 0, "resume", "fill", "uploaded", False, True))
+                    if not _advance(page, extract_page(page)):
+                        run.error = "Resume uploaded, but Workday did not advance from the upload step."
+                        break
+                    _wait_ready(page)
+                except Exception as exc:
+                    run.error = f"Workday resume upload stopped ({type(exc).__name__}); no next-page click was sent."
+                    break
+                continue
             if _grow_work(page, memory, snap):
                 continue
+            # _grow_work re-reads the page, which re-stamps every uid. If the page re-rendered meanwhile
+            # (Eightfold adds an address block after Country), the old snapshot's uids point at other controls.
+            snap = extract_page(page)
             field = _next_field(snap, handled)
             if field is not None:
-                if field.heading and field.heading != heading:
-                    heading = field.heading
-                    _emit(events, {"type": "step", "heading": heading})
-                outcome = _decide_and_write(page, field, memory, resume_path, ask, llm, run)
+                try:
+                    outcome = _decide_and_write(page, field, memory, resume_path, ask, llm, run, snapshot=snap)
+                except Exception as exc:  # noqa: BLE001 — one stuck widget should not end the whole page
+                    outcome = _outcome(field, None, "error", type(exc).__name__, asked=False, from_memory=False)
                 handled.add((field.section, field.label.casefold(), field.group))
                 run.outcomes.append(outcome)
-                _emit(events, _activity_event(memory, outcome, field.heading))
+                if field.kind == "file" and outcome.action == "error":
+                    run.error = "Resume upload did not complete; stopped before advancing."
+                    break
                 continue
             if not _advance(page, snap):
+                from pocket_agent.forms.workday import account_scope
+                if account_scope(page.url) and snap.progress and not progress_is_last(snap.progress) and not re.search(r"\breview\b", snap.progress, re.I):
+                    missing = [field.label for field in snap.fields if field.required and is_blank(field.value)]
+                    run.error = "Workday did not advance from the current step" + (": " + ", ".join(missing) if missing else "; check validation or navigation errors")
                 break
+            handled.clear()
+            from pocket_agent.forms.workday import account_scope
+            if account_scope(page.url):
+                _wait_ready(page)
+        else:
+            run.error = "Stopped after reaching the action limit; application is incomplete."
+        final_snapshot = extract_page(page)
+        run.current_step = final_snapshot.progress
+        run.status = "review" if progress_is_last(final_snapshot.progress) or re.search(r"\breview\b", final_snapshot.progress, re.I) else "blocked" if run.gate or run.error else "stopped"
         run.submits = int(page.evaluate("() => window.__pocketSubmits || 0") or 0)
         if "/submitted" in page.url:
             run.submits = max(run.submits, 1)
     except Exception as exc:  # noqa: BLE001 — the eval harness records crashes per form
         run.error = f"{type(exc).__name__}: {exc}"
-    counts = review_counts(run.outcomes)
-    if run.gate:
-        _emit(events, {"type": "gate", "gate": run.gate, **counts, "submits": run.submits})
-    elif run.error:
-        _emit(events, {"type": "error", "message": run.error})
-    else:
-        _emit(events, {"type": "review", **counts, "submits": run.submits})
     return run
 
 
-def review_counts(outcomes: list[FieldOutcome]) -> dict[str, int]:
-    filled = sum(1 for item in outcomes if item.action == "fill" and item.value and not item.asked)
-    asked = sum(1 for item in outcomes if item.asked)
-    skipped = sum(1 for item in outcomes if item.action == "skip")
-    return {"filled": filled, "asked": asked, "skipped": skipped}
-
-
-def activity_source(memory: Memory, outcome: FieldOutcome) -> str:
-    if outcome.via_model:
-        return "model"
-    if outcome.asked:
-        return "answer"
-    entry = memory.get(outcome.key) if outcome.key else None
-    if entry is not None and entry.source == "resume":
-        return "resume"
-    return "memory"
-
-
-def _emit(events: EventFn | None, payload: dict) -> None:
-    if events is not None:
-        events(payload)
-
-
-def _activity_event(memory: Memory, outcome: FieldOutcome, heading: str) -> dict:
-    return {
-        "type": "activity",
-        "label": outcome.label,
-        "action": outcome.action,
-        "value": outcome.value,
-        "source": activity_source(memory, outcome),
-        "heading": heading,
-        "asked": outcome.asked,
-    }
-
-
-def _wait_ready(page) -> PageSnapshot:
+def _wait_ready(page, settle_ms: int = 12000) -> PageSnapshot:
     try:
         page.wait_for_function("() => !document.body.classList.contains('booting')", timeout=8000)
     except Exception:
         pass
-    return extract_page(page)
+    # Client-rendered boards (Workday) show an empty shell at domcontentloaded. Wait for a question, a gate,
+    # or a button the loop can use (a step may legitimately start with only "Add another" / "Next").
+    snap = extract_page(page)
+    waited = 0
+    while not _ready(snap) and waited < settle_ms:
+        page.wait_for_timeout(250)
+        waited += 250
+        snap = extract_page(page)
+    # Eightfold renders the form in chunks: the first fields appear a second or two before the rest.
+    steady = 0
+    while snap.fields and not snap.gate and steady < 3 and waited < settle_ms:
+        page.wait_for_timeout(250)
+        waited += 250
+        count = len(snap.fields)
+        snap = extract_page(page)
+        steady = steady + 1 if len(snap.fields) == count else 0
+    return snap
+
+
+def _ready(snap: PageSnapshot) -> bool:
+    if progress_is_last(snap.progress) or re.search(r"\breview\b", snap.progress, re.I):
+        return True
+    if snap.fields or snap.gate:
+        return True
+    return any(classify_button(button.text, button_type=button.button_type, onclick=button.onclick) in {"forward", "add"} for button in snap.buttons)
 
 
 def _dismiss(page, snap: PageSnapshot) -> None:
@@ -188,16 +203,16 @@ def _grow_work(page, memory: Memory, snap: PageSnapshot) -> bool:
         have = _work_groups(snap)
         if have >= needed:
             return grew
-        button = _add_button(snap)
+        button = _add_button(snap, have)
         if button is None:
             return grew
         before = have
         page.locator(f'[data-pocket-uid="{button.uid}"]').click()
         page.wait_for_timeout(50)
-        grew = True
         snap = extract_page(page)
         if _work_groups(snap) <= before:
             return grew
+        grew = True
     return grew
 
 
@@ -208,10 +223,12 @@ def _work_groups(snap: PageSnapshot) -> int:
     return max(groups) + 1
 
 
-def _add_button(snap: PageSnapshot):
+def _add_button(snap: PageSnapshot, have: int = 0):
     for button in snap.buttons:
         kind = classify_button(button.text, button_type=button.button_type, onclick=button.onclick)
-        if kind == "add" and section_of(button.heading) in {"", "work"}:
+        section = section_of(button.heading)
+        # An unlabeled "Add another" only counts as work history once the page already shows a work block.
+        if kind == "add" and (section == "work" or (section == "" and have > 0)):
             return button
     return None
 
@@ -226,12 +243,53 @@ def _next_field(snap: PageSnapshot, handled: set[tuple[str, str, int]]) -> Extra
     return files[0] if files else (pending[0] if pending else None)
 
 
-def _decide_and_write(page, field: ExtractedField, memory: Memory, resume_path, ask: AskFn, llm, run: FormRun) -> FieldOutcome:
+def _name_confirmation(page, field: ExtractedField, memory: Memory, snapshot: PageSnapshot | None) -> str | None:
+    """Confirm only an entered name matching the profile, not a general attestation."""
+    label = field.label.casefold()
+    if not re.match(r"^have you (?:added|entered|provided) your full legal name\b", label):
+        return None
+    if ask_key(field.label, field.section):
+        return None
+    expected = memory.get("full_name")
+    if not expected or not expected.value.strip() or snapshot is None:
+        return None
+    normalize = lambda value: " ".join(value.split()).casefold()
+    names: dict[str, list[str]] = {}
+    for candidate in snapshot.fields:
+        if candidate.uid == field.uid or candidate.kind != "text":
+            continue
+        matched = match_label(candidate.label, section=candidate.section)
+        if matched and matched.key in {"full_name", "first_name", "last_name"}:
+            names.setdefault(matched.key, []).append(_read_back(page, candidate))
+    target = normalize(expected.value)
+    if len(names.get("full_name", [])) == 1 and normalize(names["full_name"][0]) == target:
+        return "Yes"
+    if len(names.get("first_name", [])) == len(names.get("last_name", [])) == 1:
+        if normalize(names["first_name"][0] + " " + names["last_name"][0]) == target:
+            return "Yes"
+    return None
+
+
+def _decide_and_write(page, field: ExtractedField, memory: Memory, resume_path, ask: AskFn, llm, run: FormRun, *, snapshot: PageSnapshot | None = None) -> FieldOutcome:
     forced = ask_key(field.label, field.section)
+    if field.kind == "file" and forced == "cover_letter":
+        # The only file we have is the resume. It does not go in a cover letter slot.
+        return _outcome(field, forced, "skip", "", asked=False, from_memory=False)
+    if field.kind == "file" and resume_path is not None and not resume_names_user(Path(resume_path), memory):
+        # Boards parse the upload and overwrite name, email, and phone with what it says. Never send someone else's resume.
+        return _outcome(field, "resume", "skip", "", asked=False, from_memory=False)
     if forced:
+        entry = memory.get(forced)
+        # Optional disclosures/preferences must not become blocking questions.
+        # Only an explicitly reusable answer justifies changing these fields.
+        if not field.required and not (entry and entry.always_use and entry.value.strip()):
+            return _outcome(field, forced, "skip", field.value, asked=False, from_memory=False)
         return _ask_or_saved(page, field, memory, resume_path, ask, forced)
-    if field.kind == "checkbox" and not field.required and ask_key(field.label, field.section):
-        return _outcome(field, None, "skip", "", asked=False, from_memory=False)
+    confirmed = _name_confirmation(page, field, memory, snapshot)
+    if confirmed:
+        written = _write(page, field, confirmed, resume_path)
+        if written:
+            return _outcome(field, "full_name_confirmation", "fill", written, asked=False, from_memory=True)
     learned = memory.learned_labels()
     match = match_label(field.label, section=field.section, learned=learned)
     base = match.key if match and match.score >= 0.93 and not is_sensitive_key(match.key) else None
@@ -250,30 +308,42 @@ def _decide_and_write(page, field: ExtractedField, memory: Memory, resume_path, 
         if written:
             return _outcome(field, key, "fill", written, asked=False, from_memory=True, via_model=agreed)
         if field.required:
-            return _ask_or_saved(page, field, memory, resume_path, ask, key or "unknown")
-    if field.required:
-        return _ask_or_saved(page, field, memory, resume_path, ask, key or "unknown")
+            return _ask_or_saved(page, field, memory, resume_path, ask, key or _label_key(field))
     if field.value and not is_blank(field.value):
-        _clear_field(page, field)
-    return _outcome(field, key, "skip", "", asked=False, from_memory=False)
+        return _outcome(field, key, "keep", field.value, asked=False, from_memory=False)
+    if field.required:
+        return _ask_or_saved(page, field, memory, resume_path, ask, key or _label_key(field))
+    # Unknown optional fields may already contain resume-parsed or user-entered
+    # values. Leaving them alone is safer than erasing them.
+    return _outcome(field, key, "skip", field.value, asked=False, from_memory=False)
+
+
+def _label_key(field: ExtractedField) -> str:
+    """A question no rule knows is saved under its own wording, so one answer never fills another question."""
+    words = re.sub(r"[^a-z0-9]+", " ", field.label.casefold()).split()
+    return "q." + "_".join(words[:12])
 
 
 def _ask_or_saved(page, field, memory, resume_path, ask, key: str) -> FieldOutcome:
     entry = memory.get(key)
+    if entry and entry.source.startswith("profile_exact:"):
+        normalize = lambda text: " ".join(text.replace('*', '').split()).strip().casefold()
+        fingerprint = hashlib.sha256(normalize(field.label).encode()).hexdigest()
+        if entry.source != "profile_exact:" + fingerprint:
+            entry = None
     sensitive = is_sensitive_key(key) or ask_key(field.label, field.section) == key
     if entry and entry.always_use and entry.value.strip():
         written = _write(page, field, entry.value, resume_path)
         if written:
             return _outcome(field, key, "fill", written, asked=False, from_memory=True)
-    answer = ask(Asked(
-        key,
-        field.label,
-        question_for(field.label),
-        kind=field.kind,
-        options=tuple(option["label"] for option in field.options if option.get("label")),
-        sensitive=sensitive,
-        section=field.heading or field.section,
-    ))
+    question = question_for(field.label)
+    if field.kind == "dropdown":
+        offered = _peek_dropdown(page, field)
+        if 0 < len(offered) <= 15:
+            question += " Options: " + " / ".join(offered)
+    answer = ask(Asked(key, field.label, question))
+    if answer.skip:
+        return _outcome(field, key, "skip", "", asked=False, from_memory=False)
     memory.put(
         key,
         answer.value,
@@ -286,6 +356,25 @@ def _ask_or_saved(page, field, memory, resume_path, ask, key: str) -> FieldOutco
     if not written and field.value and not is_blank(field.value):
         _clear_field(page, field)
     return _outcome(field, key, "ask", written, asked=True, from_memory=False)
+
+
+def resume_names_user(path: Path, memory: Memory) -> bool:
+    """True when the resume file mentions the profile's name (or there is no name to check against)."""
+    entry = memory.get("full_name")
+    name = entry.value.strip().casefold() if entry and entry.value else ""
+    if not name:
+        return True
+    try:
+        if path.suffix.casefold() == ".pdf":
+            from pypdf import PdfReader
+
+            text = "\n".join((pdf_page.extract_text() or "") for pdf_page in PdfReader(str(path)).pages)
+        else:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:  # noqa: BLE001 — an unreadable file is not proof it is the wrong person
+        return True
+    flat = " ".join(text.split()).casefold()
+    return name in flat or all(part in flat for part in name.split())
 
 
 def stored_value(memory: Memory, key: str | None, label: str) -> str:
@@ -333,23 +422,87 @@ def _llm_fill(field: ExtractedField, memory: Memory, llm) -> str | None:
 
 def _write(page, field: ExtractedField, raw: str, resume_path: Path | None) -> str:
     options = [option["label"] for option in field.options]
+    if field.kind == "workday_prompt":
+        root = page.locator(f'[data-pocket-uid="{field.uid}"]')
+        if equivalent(_read_back(page, field), raw):
+            return _read_back(page, field)
+        root.fill("")
+        root.press_sequentially(raw, delay=25)
+        root.press("Enter")
+        try:
+            page.wait_for_function("""({uid, value}) => {
+                const el = document.querySelector(`[data-pocket-uid="${uid}"]`);
+                if (!el || el.value) return false;
+                let parent=el.parentElement;
+                for(let i=0; parent&&i<4; i++,parent=parent.parentElement){
+                    const selected=parent.querySelector('[role=listbox][aria-label*="selected" i]');
+                    if(selected && selected.innerText.toLowerCase().includes(value.toLowerCase()))return true;
+                }
+                return false;
+            }""", arg={"uid": field.uid, "value": raw}, timeout=8000)
+        except Exception:
+            return ""
+        return _read_back(page, field)
+    if field.kind == "workday_select":
+        root = page.locator(f'[data-pocket-uid="{field.uid}"]')
+        if equivalent(root.inner_text(), raw):
+            return root.inner_text().strip()
+        root.click()
+        choices = page.get_by_role("option")
+        try:
+            choices.first.wait_for(state="visible", timeout=8000)
+        except Exception:
+            return ""
+        labels = choices.all_inner_texts()
+        choice = resolve_option(raw, labels)
+        if not choice:
+            root.press("Escape")
+            return ""
+        choices.nth(labels.index(choice)).click()
+        return root.inner_text().strip() if equivalent(root.inner_text(), choice) else ""
     if field.kind == "file":
         if resume_path is None:
             return ""
         page.locator(f'[data-pocket-uid="{field.uid}"]').set_input_files(str(resume_path))
+        _settle_upload(page, field.uid)
+        from pocket_agent.forms.workday import account_scope
+        if account_scope(page.url) and re.search(r"autofill with resume", page.locator("body").inner_text(), re.I):
+            _wait_workday_upload(page, Path(resume_path).name)
         return "uploaded"
+    part = date_part(field.label, raw, named=field.kind in {"dropdown", "select", "combobox"})
+    if part:
+        raw = part
+    if field.kind == "dropdown":
+        return _pick_dropdown(page, field, raw)
     target = present_value(raw, kind=field.kind, options=options, placeholder=field.placeholder, input_type=field.input_type)
     if field.kind == "date":
         variants = [target] + [item for item in date_variants(raw) if item != target]
+        if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", raw.strip()):
+            # A full day was given ("today's date"); do not shorten it to month/year first.
+            variants = [raw.strip()] + [item for item in variants if item != raw.strip()]
     else:
         variants = [target]
+    national = field.kind == "text" and bool(re.match(r"^\+\d{1,3}[\s-]+\(?\d", target or ""))
+    if national:
+        # Boards with a separate country-code picker (Eightfold) reject "+1-626-..." and want the national number.
+        variants.append(re.sub(r"^\+\d{1,3}[\s-]+", "", target))
     if not target and field.kind in {"select", "combobox", "radio"}:
         return ""
+    if field.input_type == "number":
+        target = target.replace(",", "").strip()
+        if not re.fullmatch(r"-?\d+(\.\d+)?", target):
+            # A number box refuses text; leave it for the user instead of crashing the run.
+            return ""
+        variants = [target]
     written = ""
     for variant in variants:
         if not variant:
             continue
         _apply(page, field, variant)
+        if national:
+            # Those boards validate on blur. blur() rather than a key press, so nothing can submit.
+            page.locator(f'[data-pocket-uid="{field.uid}"]').evaluate("el => el.blur()")
+            page.wait_for_timeout(300)
         page.wait_for_timeout(30)
         if not _invalid(page, field.uid):
             written = _read_back(page, field)
@@ -357,6 +510,226 @@ def _write(page, field: ExtractedField, raw: str, resume_path: Path | None) -> s
                 written = variant
             break
     return written
+
+
+_UPLOAD_BUSY = r"""
+(uid) => {
+  const el = document.querySelector(`[data-pocket-uid="${uid}"]`);
+  if (!el) return false;
+  const block = el.closest("li, [class*='question'], [class*='field'], [role=group]") || el.parentElement;
+  return [...block.querySelectorAll("*")].some((node) => {
+    if (!node.offsetParent || node.children.length) return false;
+    return /analy[sz]ing|parsing|uploading|processing/i.test(node.textContent || "");
+  });
+}
+"""
+
+
+def _settle_upload(page, uid: str) -> None:
+    """Wait while the board reads the resume. Its autofill lands then, before our values, not on top of them."""
+    page.wait_for_timeout(300)
+    for _ in range(80):
+        if not page.evaluate(_UPLOAD_BUSY, uid):
+            break
+        page.wait_for_timeout(250)
+    else:
+        raise TimeoutError("Resume upload is still processing")
+    page.wait_for_timeout(300)
+
+
+def _wait_workday_upload(page, filename: str) -> None:
+    """Do not click Next while Workday is still receiving or parsing the PDF."""
+    page.wait_for_function("""filename => {
+        const shown = el => !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+        const text = document.body.innerText;
+        const busy = [...document.querySelectorAll('[aria-busy=true], [role=progressbar]')].some(shown)
+          || /uploading|processing (?:your )?(?:resume|file)|parsing (?:your )?resume/i.test(text);
+        const error = [...document.querySelectorAll('[role=alert], [data-automation-id*=error i]')]
+          .some(el => shown(el) && /failed|unable|invalid|unsupported|too large|error/i.test(el.innerText));
+        const next = document.querySelector('[data-automation-id="bottom-navigation-next-button"], [data-automation-id="pageFooterNextButton"]');
+        const ready = !next || (!next.disabled && next.getAttribute('aria-disabled') !== 'true');
+        const uploaded = /successfully uploaded|uploaded successfully/i.test(text);
+        return !busy && !error && ready && uploaded && text.includes(filename);
+    }""", arg=filename, timeout=30000)
+
+
+def _workday_resume_step(page) -> bool:
+    from pocket_agent.forms.workday import account_scope
+    return bool(account_scope(page.url)) and bool(page.evaluate("""() =>
+        [...document.querySelectorAll('h1,h2,h3,[data-automation-id=progressBarActiveStep]')]
+        .some(el => el.getClientRects().length && /autofill with resume/i.test(el.innerText))
+    """))
+
+
+def _upload_workday_resume(page, memory: Memory, resume_path: Path | None) -> None:
+    if resume_path is None or not Path(resume_path).is_file():
+        raise FileNotFoundError("No resume PDF configured")
+    if not resume_names_user(Path(resume_path), memory):
+        raise ValueError("Resume name does not match the profile")
+    filename = Path(resume_path).name
+    # A previous run may already have uploaded the PDF. Do not upload it twice.
+    text = page.locator('body').inner_text()
+    if filename in text and re.search(r"successfully uploaded|uploaded successfully", text, re.I):
+        _wait_workday_upload(page, filename)
+        return
+    target = page.locator('input[type=file][data-automation-id="file-upload-input-ref"]')
+    # Older layouts have an unmarked hidden input beside the drop zone.
+    if not target.count() and page.locator('input[type=file]').count() == 1:
+        target = page.locator('input[type=file]')
+    target.wait_for(state="attached", timeout=45000)
+    target.set_input_files(str(resume_path))
+    _wait_workday_upload(page, filename)
+
+
+_NEARBY_OPTIONS = r"""
+(uid) => {
+  document.querySelectorAll("[data-pocket-pick]").forEach((node) => node.removeAttribute("data-pocket-pick"));
+  const el = document.querySelector(`[data-pocket-uid="${uid}"]`);
+  if (!el || !el.parentElement) return [];
+  const seen = [];
+  for (const node of el.parentElement.querySelectorAll("[role=option], [class*='result'] > *, [class*='suggestion'], [class*='option']")) {
+    if (node.contains(el) || !node.offsetParent || node.querySelector("[role=option]")) continue;
+    const text = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+    if (!text || /no .*found|loading|no results/i.test(text)) continue;
+    node.setAttribute("data-pocket-pick", String(seen.length));
+    seen.push(text);
+  }
+  return seen;
+}
+"""
+
+
+def _pick_nearby(page, field: ExtractedField, value: str) -> bool:
+    """Type like a person so the board searches, then click the suggestion that matches the answer."""
+    root = page.locator(f'[data-pocket-uid="{field.uid}"]')
+    for query in dict.fromkeys([value, value.split(",")[0].strip()]):
+        if not query:
+            continue
+        root.click()
+        root.fill("")
+        root.press_sequentially(query, delay=25)
+        for _ in range(12):
+            page.wait_for_timeout(250)
+            labels = page.evaluate(_NEARBY_OPTIONS, field.uid) or []
+            choice = resolve_option(value, labels) or closest_option(value, labels)
+            if choice:
+                page.locator(f'[data-pocket-pick="{labels.index(choice)}"]').click()
+                page.wait_for_timeout(100)
+                return True
+    root.fill(value)
+    return False
+
+
+_BOX = r"""
+(uid) => {
+  document.querySelectorAll("[data-pocket-box]").forEach((el) => el.removeAttribute("data-pocket-box"));
+  const el = document.querySelector(`[data-pocket-uid="${uid}"]`);
+  if (!el) return;
+  const box = el.closest(".select-shell") || el.closest("[class*='select__container']") || el.parentElement;
+  box.setAttribute("data-pocket-box", uid);
+}
+"""
+
+_BOX_OPTIONS = r"""
+(uid) => {
+  // Some selects render options into a separate listbox, named by aria-controls, once opened.
+  const input = document.querySelector(`[data-pocket-uid="${uid}"]`);
+  const list = input && document.getElementById(input.getAttribute("aria-controls") || "");
+  if (list && !list.hasAttribute("data-pocket-box")) {
+    document.querySelectorAll(`[data-pocket-box="${uid}"]`).forEach((el) => el.removeAttribute("data-pocket-box"));
+    list.setAttribute("data-pocket-box", uid);
+  }
+  const box = document.querySelector(`[data-pocket-box="${uid}"]`);
+  if (!box) return null;
+  const labels = [...box.querySelectorAll("[role=option]")].map((el) => (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim());
+  const text = (box.innerText || "").toLowerCase();
+  const loading = /loading/.test(text);
+  return { labels, loading, done: !loading && (labels.length > 0 || /no options|no results|not found/.test(text)) };
+}
+"""
+
+
+def _dropdown_queries(raw: str) -> list[str]:
+    """Empty first (short lists show everything), then the answer, then shorter searches for long names.
+
+    Search boxes match the typed text literally, so "University of California, Los Angeles" finds nothing
+    when the site spells it "University of California - Los Angeles". The shorter searches drop punctuation.
+    """
+    plain = re.sub(r"\s*\([^)]*\)", "", raw).strip()
+    words = re.sub(r"[^\w']+", " ", plain).split()
+    queries = [""]
+    for query in (raw, plain, " ".join(words)):
+        if query and query not in queries:
+            queries.append(query)
+    for count in range(len(words) - 1, 1, -1):
+        prefix = " ".join(words[:count])
+        if prefix not in queries:
+            queries.append(prefix)
+    return queries[:6]
+
+
+def _dropdown_labels(page, uid: str, before: dict | None = None) -> list[str]:
+    """Options for the text just typed.
+
+    An async list keeps showing the last search ("No options", or the old matches) until its debounce
+    fires, so a reading only counts once the list has visibly changed or had time to, and it must read
+    the same twice in a row.
+    """
+    old = before["labels"] if before else None
+    moved = before is None
+    last = None
+    for step in range(20):
+        page.wait_for_timeout(150)
+        seen = page.evaluate(_BOX_OPTIONS, uid)
+        if not seen:
+            continue
+        if seen["loading"] or seen["labels"] != old:
+            moved = True
+        if not moved and step < 6:
+            continue
+        if not seen["done"]:
+            last = None
+            continue
+        if seen["labels"] == last:
+            return list(last)
+        last = seen["labels"]
+    return list(last or [])
+
+
+def _peek_dropdown(page, field: ExtractedField) -> list[str]:
+    """Open the menu with no search, note what it offers, and close it again."""
+    root = page.locator(f'[data-pocket-uid="{field.uid}"]')
+    page.evaluate(_BOX, field.uid)
+    root.click()
+    root.fill("")
+    labels = _dropdown_labels(page, field.uid)
+    root.press("Escape")
+    return labels
+
+
+def _pick_dropdown(page, field: ExtractedField, raw: str) -> str:
+    """Open a search-select, look at what it offers, and click an option only when one clearly matches."""
+    root = page.locator(f'[data-pocket-uid="{field.uid}"]')
+    page.evaluate(_BOX, field.uid)
+    options = page.locator(f'[data-pocket-box="{field.uid}"] [role=option]')
+    for query in _dropdown_queries(raw):
+        # Clicking a react-select input while its menu is open closes it, and a closed menu does not search.
+        if root.get_attribute("aria-expanded") != "true":
+            root.click()
+        before = page.evaluate(_BOX_OPTIONS, field.uid)
+        root.fill(query)
+        labels = _dropdown_labels(page, field.uid, before)
+        choice = resolve_option(raw, labels) or closest_option(raw, labels)
+        if choice:
+            options.nth(labels.index(choice)).click()
+            page.wait_for_timeout(50)
+            if root.count() == 0:
+                # Picking it removed the field (Greenhouse drops race and resets Hispanic/Latino on "Decline").
+                return choice
+            return _read_back(page, field) or choice
+    root.fill("")
+    root.press("Escape")
+    return ""
 
 
 def _apply(page, field: ExtractedField, value: str) -> None:
@@ -400,13 +773,20 @@ def _apply(page, field: ExtractedField, value: str) -> None:
             if choice.count():
                 choice.first.click()
                 return
-        root.fill(value)
+            root.fill(value)
+            return
+        _pick_nearby(page, field, value)
         return
+    picker = field.kind == "date" and root.get_attribute("aria-haspopup") == "dialog"
+    if picker and root.evaluate("el => el.readOnly"):
+        root.click()  # Eightfold's date picker only accepts typing once it is open.
     root.fill(value)
+    if picker:
+        root.press("Tab")  # Commit and close the calendar. Never Enter: that can submit the form.
 
 
 def _clear_field(page, field: ExtractedField) -> None:
-    if field.kind in {"file", "radio", "combobox", "typeahead"}:
+    if field.kind in {"file", "radio", "combobox", "typeahead", "dropdown"}:
         return
     locator = page.locator(f'[data-pocket-uid="{field.uid}"]')
     if field.kind == "checkbox":
@@ -416,6 +796,17 @@ def _clear_field(page, field: ExtractedField) -> None:
 
 
 def _read_back(page, field: ExtractedField) -> str:
+    if field.kind == "workday_select":
+        return page.locator(f'[data-pocket-uid="{field.uid}"]').inner_text().strip()
+    if field.kind == "workday_prompt":
+        return page.locator(f'[data-pocket-uid="{field.uid}"]').evaluate("""el => {
+            let parent=el.parentElement;
+            for(let i=0; parent&&i<4; i++,parent=parent.parentElement){
+                const selected=parent.querySelector('[role=listbox][aria-label*="selected" i]');
+                if(selected)return selected.innerText.trim();
+            }
+            return '';
+        }""")
     if field.kind == "radio":
         for option in field.options:
             if option["uid"] and page.locator(f'[data-pocket-uid="{option["uid"]}"]').is_checked():
@@ -423,6 +814,14 @@ def _read_back(page, field: ExtractedField) -> str:
         return ""
     if field.kind == "checkbox":
         return "Yes" if page.locator(f'[data-pocket-uid="{field.uid}"]').is_checked() else "No"
+    if field.kind == "dropdown":
+        return page.locator(f'[data-pocket-uid="{field.uid}"]').evaluate(
+            """(el) => {
+              const shell = el.closest(".select-shell") || el.closest("[class*='select__container']") || el.parentElement;
+              const value = shell && shell.querySelector("[class*='single-value']");
+              return value ? (value.innerText || value.textContent || "").trim() : (el.value || "").trim();
+            }"""
+        )
     if field.kind == "combobox":
         raw = page.locator(f'[data-pocket-uid="{field.uid}"]').inner_text().strip()
         return "" if raw.casefold() in {"select one", "select", "choose", "choose one"} else raw
@@ -452,6 +851,58 @@ def _advance(page, snap: PageSnapshot) -> bool:
         return False
     forwards = []
     for button in snap.buttons:
+        # Workday's wizard navigation is type=submit on intermediate pages too.
+        target = page.locator(f'[data-pocket-uid="{button.uid}"]')
+        from pocket_agent.forms.workday import account_scope
+        workday_next = (
+            account_scope(page.url)
+            and (_workday_resume_step(page) or bool(snap.progress))
+            and not re.search(r"\breview\b", snap.progress, re.I)
+            and not re.search(r"\breview\b", button.heading, re.I)
+            and button.text.casefold() in {"next", "continue", "save and continue"}
+            and target.get_attribute("data-automation-id") in {"bottom-navigation-next-button", "pageFooterNextButton"}
+        )
+        if workday_next:
+            upload_step = _workday_resume_step(page)
+            attached = not upload_step or any(field.kind == "file" and field.value == "uploaded" for field in snap.fields) or bool(
+                re.search(r"\S+\.pdf\b", page.locator("body").inner_text(), re.I)
+            )
+            if any(field.required and is_blank(field.value) for field in snap.fields):
+                return False
+            if page.locator('input:invalid, select:invalid, textarea:invalid, [aria-invalid=true]').count():
+                return False
+            if attached and target.is_enabled():
+                if target.get_attribute("aria-hidden") == "true":
+                    overlay = page.locator('[data-automation-id="click_filter"]').and_(
+                        page.get_by_role("button", name=button.text, exact=True)
+                    )
+                    if overlay.count() != 1 or not overlay.is_visible():
+                        return False
+                    target = overlay
+                target.evaluate("el => {const form = el.closest('form'); if (form) form.dataset.pocketWizard='true';}")
+                try:
+                    target.click(timeout=8000)
+                    if upload_step:
+                        page.wait_for_function("""() => [...document.querySelectorAll('h1,h2,h3')]
+                            .some(el => el.getClientRects().length && /^my information$/i.test(el.innerText.trim()))""", timeout=30000)
+                    else:
+                        page.wait_for_function(r"""before => {
+                            const step = document.querySelector('[data-automation-id=progressBarActiveStep], #progress');
+                            const normalize = text => text.replace(/\s+/g,' ').trim();
+                            const current = step && normalize(step.innerText);
+                            if (!current || current === normalize(before)) return false;
+                            const title = current.replace(/^current step \d+ of \d+\s*/i,'').toLowerCase();
+                            return [...document.querySelectorAll('h1,h2,h3')].some(el => {
+                                const heading=normalize(el.innerText).toLowerCase();
+                                return el.getClientRects().length && heading && (heading===title || title.startsWith(heading+' '));
+                            });
+                        }""", arg=snap.progress, timeout=30000)
+                    return True
+                except Exception:
+                    return False
+                finally:
+                    page.locator('form[data-pocket-wizard]').evaluate_all("forms=>forms.forEach(form=>delete form.dataset.pocketWizard)")
+            continue
         kind = classify_button(
             button.text,
             button_type=button.button_type,

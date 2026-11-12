@@ -48,3 +48,33 @@ def test_login_wall_and_review_continue_do_not_submit(tmp_path: Path) -> None:
     finally:
         memory.close()
         server.stop()
+
+
+def test_name_confirmation_checks_actual_entered_name(tmp_path: Path) -> None:
+    from pocket_agent.forms.engine import FormRun, UserAnswer, _decide_and_write
+    from pocket_agent.forms.memory import Memory
+    from pocket_agent.forms.reader import extract_page
+
+    memory = Memory(tmp_path / "names.sqlite")
+    memory.put("full_name", "Jordan Alex Hale", source="resume")
+    question = "Have you added your full legal name and surname (including any middle names)? This is just so our systems can match you correctly."
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            for entered, asked in (("Jordan Alex", False), ("Jordan", True)):
+                page.set_content(f'''<label>First name<input value="{entered}"></label>
+                    <label>Last name<input value="Hale"></label>
+                    <label>{question}<select required><option value="">Choose</option><option>Yes</option><option>No</option></select></label>''')
+                snapshot = extract_page(page)
+                prompts = []
+                def ask(item):
+                    prompts.append(item)
+                    return UserAnswer("")
+                outcome = _decide_and_write(page, snapshot.fields[-1], memory, None, ask, None, FormRun(url="test"), snapshot=snapshot)
+                assert bool(prompts) is asked
+                assert outcome.asked is asked
+                assert page.locator("select").input_value() == ("" if asked else "Yes")
+            browser.close()
+    finally:
+        memory.close()

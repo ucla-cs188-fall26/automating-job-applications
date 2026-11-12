@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -150,6 +151,10 @@ def main(argv: list[str] | None = None) -> int:
     fill.add_argument("url")
     fill.add_argument("--model", default="0.6b", choices=["none", "0.6b", "1.7b", "4b"])
     fill.add_argument("--resume", type=Path)
+    fill.add_argument("--workday-accounts", action="store_true", help="Create/sign in to Workday accounts using macOS Keychain")
+    mode = fill.add_mutually_exclusive_group()
+    mode.add_argument("--unattended", dest="unattended", action="store_true", default=None, help="Never prompt in the terminal; use saved answers and report unresolved fields")
+    mode.add_argument("--interactive", dest="unattended", action="store_false", help="Ask for missing answers, overriding the saved unattended setting")
     fill.set_defaults(func=cmd_fill)
 
     ui = sub.add_parser("ui", help="Open the local form desk in a browser")
@@ -493,6 +498,8 @@ def cmd_fill(args: argparse.Namespace) -> int:
     from pocket_agent.forms.policy import is_sensitive_key
     from pocket_agent.forms.seed import seed_memory
 
+    if args.unattended is None:
+        args.unattended = bool((load_config().get("fill") or {}).get("unattended", False))
     home = data_home()
     profile_path = home / "profile.yaml"
     if not profile_path.exists():
@@ -500,6 +507,34 @@ def cmd_fill(args: argparse.Namespace) -> int:
         return 1
     profile = load_profile(profile_path)
     resume = args.resume or (home / "resume.pdf")
+    if resume.exists():
+        from pocket_agent.resume import resume_contact_profile
+        try:
+            profile = resume_contact_profile(profile, resume)
+        except Exception:
+            print("Could not extract resume contacts. Check that your resume is readable and contains one email address.")
+            return 1
+    accounts = None
+    if args.workday_accounts:
+        from getpass import getpass
+        from pocket_agent.forms.workday import KeychainCredentials, WorkdayAccounts, account_scope
+
+        if not resume.exists():
+            print("Workday account creation needs your resume at ~/.pocket-agent/resume.pdf or --resume PATH.")
+            return 1
+        email = str(profile.get("email") or "")
+        if not email:
+            print("No email was found in the resume or profile. Add it to either source and retry.")
+            return 1
+        if not account_scope(args.url):
+            print("--workday-accounts requires an HTTPS Workday career-site URL.")
+            return 1
+        try:
+            password_prompt = (lambda _: "") if args.unattended else getpass
+            accounts = WorkdayAccounts(args.url, str(profile.get("email") or ""), KeychainCredentials(), password_prompt, default_password=os.environ.get("POCKET_AGENT_ACCOUNT_PASSWORD"))
+        except RuntimeError as exc:
+            print(str(exc))
+            return 1
     memory = Memory(home / "forms.sqlite")
     seed_memory(memory, profile, resume_path=str(resume) if resume.exists() else "")
     decider = None if args.model == "none" else LocalDecider(args.model)
@@ -507,7 +542,13 @@ def cmd_fill(args: argparse.Namespace) -> int:
         print(f"Form model fallback is off ({decider.error}). Known fields still fill from memory.")
         decider = None
 
+    unresolved: list[str] = []
+
     def ask(asked: Asked) -> UserAnswer:
+        if args.unattended:
+            if asked.label not in unresolved:
+                unresolved.append(asked.label)
+            return UserAnswer("", skip=True)
         print(asked.question)
         value = input("> ").strip()
         always = False
@@ -518,10 +559,64 @@ def cmd_fill(args: argparse.Namespace) -> int:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=False)
         page = browser.new_page()
-        run = fill_form(page, args.url, memory, resume if resume.exists() else None, ask, decider)
+        resume_file = resume if resume.exists() else None
+        runs = [fill_form(page, args.url, memory, resume_file, ask, decider)]
+        # The opt-in adapter handles only recognized Workday account controls.
+        while runs[-1].gate and not runs[-1].error and not runs[-1].submits and len(runs) <= 20:
+            account_message = False
+            if accounts is not None:
+                try:
+                    step = accounts.step(page, runs[-1].gate)
+                except Exception as exc:
+                    # Never print exceptions that might include account field values.
+                    print(f"Workday account handling failed ({type(exc).__name__}). Complete this step in the browser.")
+                    account_message = True
+                else:
+                    if step.message:
+                        print(step.message)
+                        account_message = True
+                    if step.progressed:
+                        runs.append(fill_form(page, args.url, memory, resume_file, ask, decider, resume=True))
+                        continue
+            if not account_message:
+                print(_GATE_HELP.get(runs[-1].gate, f"Stopped at a {runs[-1].gate} page."))
+            if args.unattended:
+                break
+            print("After completing the indicated step, press Enter to continue (or type q to stop).")
+            try:
+                if input("> ").strip().lower() in {"q", "quit", "stop"}:
+                    break
+            except EOFError:
+                break
+            runs.append(fill_form(page, args.url, memory, resume_file, ask, decider, resume=True))
+        run = runs[-1]
+        run.outcomes = [outcome for item in runs for outcome in item.outcomes]
+        run.submits = max(item.submits for item in runs)
+        if args.unattended:
+            import json
+            report_path = home / "last-fill-report.json"
+            report_path.write_text(json.dumps({"url": args.url, "status": run.status, "current_step": run.current_step, "gate": run.gate, "error": run.error, "unresolved": unresolved, "submits": run.submits}, indent=2))
+            print(f"Unattended run {run.status}. Current step: {run.current_step or 'unknown'}. Unresolved fields: {len(unresolved)}. Report: {report_path}")
+            if run.error:
+                print(run.error)
+            for label in unresolved:
+                print(f"needs answer: {label}")
+            print("Browser left open for review. Close the browser window to exit.")
+            try:
+                page.wait_for_event("close", timeout=0)
+            except Exception:
+                pass
+        elif not run.gate and not run.error:
+            print("Stopped before submit. Review the browser window and submit it yourself, then press Enter to close it.")
+            try:
+                input()
+            except EOFError:
+                pass
         browser.close()
     memory.close()
     _print_fill(run)
+    if args.unattended and (run.gate or unresolved) and not run.submits and not run.error:
+        return 2
     return 1 if run.submits or run.error else 0
 
 
@@ -537,9 +632,20 @@ def cmd_eval_forms(args: argparse.Namespace) -> int:
     return 0 if report["bar"]["pass"] else 1
 
 
+_GATE_HELP = {
+    "start": "This is the job posting, not the form. In the browser window, click Apply yourself (on Workday, then 'Apply Manually').",
+    "login": "Complete this account step in the browser window. Workday account automation is available with --workday-accounts; other login flows are manual.",
+    "captcha": "The site is showing a CAPTCHA. Solve it yourself in the browser window.",
+    "verification": "Complete email verification or two-factor authentication in the browser window.",
+    "consent": "The site is asking you to agree to something (for example a data privacy agreement after the resume upload). Read it and click Agree or Cancel yourself in the browser window.",
+}
+
+
 def _print_fill(run) -> None:
     if run.error:
         print(run.error)
+    if run.gate:
+        print(f"Stopped at a {run.gate} page: {_GATE_HELP.get(run.gate, '')}")
     print(f"Submit clicks: {run.submits}")
     for outcome in run.outcomes:
         if outcome.action == "fill" and outcome.value:

@@ -1,4 +1,13 @@
 schema_version: 1
+personal:
+  # Fallback facts absent from the resume. Fill these with your own details.
+  address_line_1: ""
+  address_line_2: ""
+  city: ""
+  region: ""
+  postal_code: ""
+  county: ""
+  country: ""
 canary: POCKET-AGENT-CANARY-7f3a
 name: Jordan Hale
 email: jordan.hale@example.com
@@ -13,6 +22,8 @@ education:
   - school: Northwind University
     degree: BS
     field: Computer Science
+    # Optional: add your actual enrollment month to fill "Start date year/month".
+    # start: "2022-09"
     graduation: "2026-05"
     gpa: 3.6
 citizenship:

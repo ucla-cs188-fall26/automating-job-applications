@@ -90,3 +90,44 @@ def test_option_and_date_formatting() -> None:
     assert present_value("2025-05", kind="date", options=[], placeholder="MM/YYYY") == "05/2025"
     assert equivalent("05/2025", "May 2025")
     assert equivalent("+1-555-0100", "5550100") or equivalent("+1-555-0100", "+1-555-0100")
+
+
+def test_profile_education_dates_are_scoped_and_split(tmp_path) -> None:
+    from pocket_agent.forms.match import indexed_key
+    from pocket_agent.forms.seed import eval_profile, seed_memory
+    from pocket_agent.forms.values import date_part
+
+    profile = eval_profile()
+    profile["education"][0]["start"] = "2022-09"
+    profile["education"].append({"school": "Second school", "start": "2020-08", "graduation": "2022-05"})
+    memory = Memory(tmp_path / "dates.sqlite")
+    try:
+        seed_memory(memory, profile)
+        for section, group, label, expected in (
+            ("education", 0, "Start date year", "2022"),
+            ("education", 0, "Start date month", "September"),
+            ("education", 0, "End date year", "2026"),
+            ("education", 1, "Start date year", "2020"),
+            ("education", 1, "End date month", "May"),
+            ("work", 0, "Start date year", "2025"),
+            ("work", 1, "Start date year", "2024"),
+        ):
+            match = match_label(label, section=section)
+            entry = memory.get(indexed_key(match.key, group))
+            assert entry is not None
+            assert date_part(label, entry.value, named=True) == expected
+    finally:
+        memory.close()
+
+
+def test_missing_education_start_is_not_inferred(tmp_path) -> None:
+    from pocket_agent.forms.match import indexed_key
+    from pocket_agent.forms.seed import eval_profile, seed_memory
+
+    memory = Memory(tmp_path / "missing.sqlite")
+    try:
+        seed_memory(memory, eval_profile())
+        match = match_label("Start date year", section="education")
+        assert memory.get(indexed_key(match.key, 0)) is None
+    finally:
+        memory.close()

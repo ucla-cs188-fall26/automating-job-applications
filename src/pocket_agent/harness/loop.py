@@ -65,6 +65,7 @@ Tools:
 If the user says not to include a kind of role, exclude it.
 If a role is ineligible, say not to apply and name the blocker.
 Never invent salary, veteran status, disability, notice period, travel, references, or demographics.
+Read profile_get before asking for a profile fact such as a graduation date. Education entries use graduation (YYYY-MM).
 Never claim an application was submitted.
 """
 
@@ -91,7 +92,7 @@ def _tool_hint(prompt: str) -> str:
         return "db_upsert"
     if any(word in text for word in ("refresh", "pull", "greenhouse", "lever")):
         return "fetch_feed"
-    if any(word in text for word in ("github", "degree", "school", "sponsor", "authorized", "clearance", "skill", "profile")):
+    if any(word in text for word in ("github", "degree", "school", "graduation", "graduate", "sponsor", "authorized", "clearance", "skill", "profile")):
         return "profile_get"
     if "detail" in text or "job id" in text:
         return "get_job"
@@ -123,6 +124,8 @@ _TOOL_WORDS = (
     "reference",
     "clearance",
     "degree",
+    "graduation",
+    "graduate",
     "skill",
     "github",
     "internship",
@@ -247,6 +250,28 @@ def run_agent(
                 "latency_s": completion.latency_s,
             }
         )
+        asking = parsed["action"] == "ask_user" or (
+            parsed["action"] == "tool" and parsed["tool"] == "ask_user"
+        )
+        if asking and _tool_hint(prompt) == "profile_get" and not any(
+            call["name"] == "profile_get" for call in result.tools
+        ):
+            # Missing from the conversation does not mean missing from disk.
+            # Read once, including for the ask_user tool path, then let the
+            # model answer from the result or ask if the fact really is absent.
+            arguments: dict[str, Any] = {}
+            tool_result = execute("profile_get", arguments, ctx)
+            result.tools.append({"name": "profile_get", "arguments": arguments, "result": tool_result})
+            trace.write({"role": "tool", "name": "profile_get", "arguments": arguments, "result": tool_result})
+            messages.append({"role": "assistant", "content": completion.text})
+            correction = tool_result_message("profile_get", tool_result) + (
+                "\nCheck this saved profile before asking the user. "
+                "Education.graduation is the graduation date (YYYY-MM). "
+                "Answer from the saved value if present; ask only if it is missing."
+            )
+            messages.append({"role": "user", "content": correction})
+            trace.write({"role": "user", "content": correction})
+            continue
         if parsed["action"] == "final":
             nudge = _nudge_for(prompt, parsed["answer"], bool(result.tools)) if nudges_left else None
             if nudge:

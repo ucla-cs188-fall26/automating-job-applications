@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 from typing import Any
 
 import yaml
@@ -79,9 +80,18 @@ def seed_memory(memory: Memory, profile: dict[str, Any], *, resume_path: str = "
     _put(memory, "email", str(profile.get("email") or ""))
     _put(memory, "phone", str(profile.get("phone") or ""))
     location = profile.get("location") or {}
+    personal = profile.get("personal") or {}
+    for source_key, target_key in {
+        "address_line_1": "address_line", "address_line_2": "address_line_2",
+        "postal_code": "postal_code", "county": "county",
+    }.items():
+        value = location.get(source_key) or personal.get(source_key)
+        if value:
+            memory.put(target_key, str(value), source="profile")
     _put(memory, "city", str(location.get("city") or ""))
     _put(memory, "region", str(location.get("region") or ""))
     _put(memory, "country", str(location.get("country") or ""))
+    _put(memory, "location", ", ".join(str(part) for part in (location.get("city"), location.get("region")) if part))
     _put(memory, "willing_to_relocate", "Yes" if location.get("willing_to_relocate") else "No")
     _put(memory, "remote_ok", "Yes" if location.get("remote_ok") else "No")
     education = (profile.get("education") or [{}])[0]
@@ -90,6 +100,9 @@ def seed_memory(memory: Memory, profile: dict[str, Any], *, resume_path: str = "
     _put(memory, "field", str(education.get("field") or ""))
     _put(memory, "graduation", str(education.get("graduation") or ""))
     _put(memory, "gpa", str(education.get("gpa") or ""))
+    for index, school in enumerate(profile.get("education") or []):
+        _put(memory, f"education.{index}.start", str(school.get("start") or ""))
+        _put(memory, f"education.{index}.end", str(school.get("end") or school.get("graduation") or ""))
     for index, job in enumerate(profile.get("experience") or []):
         _put(memory, f"work.{index}.title", str(job.get("title") or ""))
         _put(memory, f"work.{index}.org", str(job.get("org") or ""))
@@ -100,8 +113,10 @@ def seed_memory(memory: Memory, profile: dict[str, Any], *, resume_path: str = "
     citizenship = profile.get("citizenship") or {}
     places = citizenship.get("authorized_to_work") or []
     _put(memory, "work_authorization", "Yes" if "US" in places else "No")
-    _put(memory, "located_in_us", "Yes" if str(citizenship.get("country") or "").upper() == "US" else "No")
-    _put(memory, "auth_status", "Citizen" if str(citizenship.get("country") or "").upper() == "US" else "")
+    residence = str(location.get("country") or "").casefold()
+    _put(memory, "located_in_us", "Yes" if residence in {"us", "usa", "united states", "united states of america"} else "No")
+    status = "Citizen" if str(citizenship.get("country") or "").upper() == "US" else "Permanent Resident" if "US" in (citizenship.get("permanent_residence") or []) else ""
+    _put(memory, "auth_status", status)
     degree = str(education.get("degree") or "")
     _put(memory, "has_bachelors", "Yes" if degree.upper() in {"BS", "BA", "BSC", "BACHELOR", "BACHELOR'S"} or "bachelor" in degree.casefold() else "No")
     jobs = list(profile.get("experience") or [])
@@ -124,6 +139,16 @@ def seed_memory(memory: Memory, profile: dict[str, Any], *, resume_path: str = "
     _put(memory, "github", str(links.get("github") or ""))
     if resume_path:
         _put(memory, "resume", resume_path)
+    from pocket_agent.forms.policy import is_sensitive_key
+    for key, answer in (profile.get("form_answers") or {}).items():
+        if isinstance(answer, str) and not is_sensitive_key(key):
+            _put(memory, key, answer)
+        elif isinstance(answer, dict) and answer.get("always_use") is True and answer.get("value"):
+            source = "profile"
+            if answer.get("label"):
+                label = " ".join(answer["label"].replace('*', '').split()).strip().casefold()
+                source = "profile_exact:" + hashlib.sha256(label.encode()).hexdigest()
+            memory.put(key, str(answer["value"]), source=source, sensitive=is_sensitive_key(key), always_use=True, label=answer.get("label"))
 
 
 def _put(memory: Memory, key: str, value: str) -> None:

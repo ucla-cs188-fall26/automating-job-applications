@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.2.0"]
+accounts = ["keyring>=25.0"]
 
 [project.scripts]
 pocket-agent = "pocket_agent.cli:main"

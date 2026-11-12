@@ -10,7 +10,7 @@ It does not submit applications. There is no apply tool, and `pocket-agent fill`
 
 `pocket-agent fill <url>` opens the page in Chromium, reads every field it can see, and fills the ones that match the local profile. Anything it does not know, and anything on the always-ask list, it asks in the terminal and stores the answer. Saved answers are reused only when the question is the same fact. "Authorized to work" is not "requires sponsorship."
 
-Always asked, unless you already saved an explicit "always use this" answer: essays and cover letters, salary, start date, spoken languages and interview language, export-control and government or conflict-of-interest questions, "will you have finished your degree" and graduation-window checks, hybrid or on-site schedule and office choice, EEO (gender, Hispanic/Latino, race, veteran, disability), e-signature, certification, and arbitration checkboxes. Passwords are not typed. A sign-in page or a CAPTCHA stops the run.
+Always asked, unless you already saved an explicit "always use this" answer: essays and cover letters, salary, start date, spoken languages and interview language, export-control and government or conflict-of-interest questions, "will you have finished your degree" and graduation-window checks, hybrid or on-site schedule and office choice, EEO (gender, Hispanic/Latino, race, veteran, disability), e-signature, certification, and arbitration checkboxes. By default passwords are not typed and a sign-in page stops the run. Opt-in Workday account support is described below. CAPTCHA and email verification are handed to you in the browser.
 
 The page reader is ordinary code. It uses the label, `aria-label`, `aria-labelledby`, and nearby text. It handles text, text areas, native selects, radio groups, checkboxes, dates, file upload, ARIA comboboxes, and typeahead lists. Multi-step pages advance with Next or Continue. A button is not clicked when it submits, when it says Submit, Apply, or Finish, when it says Continue on a Review step, or when the page says it is the last step (`Step 3 of 3`). Resume parse mistakes are overwritten from the profile. The command prints what it filled, what it asked, and what it skipped.
 
@@ -40,22 +40,106 @@ uv run pocket-agent eval-forms --suite hard --runs 3 --model 0.6b --out form-eva
 
 `--suite` is `easy` (29 short forms), `hard` (20 forms shaped like Workday, Taleo, Oracle, Greenhouse, and custom pages), or `both`. Companies and the applicant are invented. It does not open a real job site.
 
-### Local desk
+### Workday accounts (macOS)
 
-`pocket-agent ui` serves a chat page on `http://127.0.0.1:8765` and opens it. The host is localhost only. There is no account and no external asset host. Paste an application link and press Start. The filler uses its own Chromium window, headed unless "Run the form window in the background" is checked. Questions show up as chat bubbles. Review ends with the counts and the line "Review the form in the browser window and click Submit yourself." My answers edits the profile, the resume, and saved memory. Settings picks `0.6b` (the default), `1.7b`, `4b`, or `none`, and shows whether that GGUF is on disk.
+Add `--unattended` to run without terminal prompts. Saved profile/memory answers
+are used, unresolved fields are skipped without overwriting saved answers, and
+account/verification blockers stop automation without waiting for terminal input.
+The browser stays open for review; closing it exits the command. A summary is
+written to `~/.pocket-agent/last-fill-report.json`; unresolved fields or a gate
+produce exit code 2. Final submission remains manual.
+The report includes the active step and a `review`, `blocked`, or `stopped` status;
+zero unresolved answers alone does not mean the application reached Review.
 
-```bash
-uv run pocket-agent ui
-uv run pocket-agent ui --port 8765 --no-open
+To make this the default, set `fill: {unattended: true}` in
+`~/.pocket-agent/config.yaml`. Use `--interactive` to override it for one run.
+Optional fields, including optional disclosure/preference checkboxes, are left
+unchanged unless an explicit reusable answer exists. They do not trigger a
+question simply because their wording matches an always-ask category.
+
+Reusable answers can be configured in `~/.pocket-agent/profile.yaml`:
+
+Resume contact facts take priority; missing contact facts fall back to the personal
+section and existing profile fields. The personal section also supplies facts that
+typically are not on a resume:
+
+```yaml
+personal:
+  email: ""  # Optional fallback if the resume has no email
+  phone: ""
+  address_line_1: ""
+  address_line_2: ""
+  city: ""
+  region: ""
+  postal_code: ""
+  county: ""
+  country: ""
 ```
 
-![Home](/opt/cursor/artifacts/ui-home.png)
+Fill those values once; empty values are not guessed. Address lines, postal code,
+and county map to the corresponding application fields. Resume parsing currently
+extracts contact facts, not every education/employment fact; the existing structured
+education, experience, citizenship and preferences sections remain the fallback
+for those fields. For reusable question answers:
 
-![Question](/opt/cursor/artifacts/ui-question.png)
+```yaml
+form_answers:
+  how_did_you_hear: Simplify
+```
 
-![Review](/opt/cursor/artifacts/ui-review.png)
+For sensitive questions an explicit mapping such as
+`{value: "Decline to answer", always_use: true}` is required to reuse an answer.
+Missing required facts can still prevent a site from advancing; unattended mode
+reports those facts instead of inventing them.
 
-![My answers](/opt/cursor/artifacts/ui-answers.png)
+Install the optional Keychain dependency, then enable account handling for a Workday URL:
+
+```bash
+uv sync --extra dev --extra accounts
+uv run pocket-agent fill 'https://COMPANY.wd5.myworkdayjobs.com/en-US/CAREER_SITE/job/LOCATION/ROLE_ID' --model none --workday-accounts
+```
+
+Use a real job URL from the employer and replace `~/.pocket-agent/resume.pdf` with your
+actual resume first. The filler reads the resume's email and uses it for both account
+email and username without prompting. The bundled sample resume is allowed for testing;
+an email missing from both sources, or ambiguous resume emails, stop account setup before registration. A standalone name, phone, GitHub, and LinkedIn
+from the resume override profile contact fields when recognized. Other structured
+facts still come from `profile.yaml`; this is not a complete resume-to-profile parser.
+To specify a password for new accounts, set `POCKET_AGENT_ACCOUNT_PASSWORD` in your
+environment. Saved credentials are reused for existing accounts. The site's password
+requirements still apply.
+The adapter opens Apply / Apply Manually, opens Create Account when no credential is saved,
+creates a random 24-character password, stores it in macOS Keychain before sending the
+registration form, and signs in on later runs. Interrupted registrations remain marked pending so a saved password alone is not mistaken for a successfully created account. Credentials are scoped to the Workday host,
+career site, and email; they are never written to the profile, form memory, or chat traces.
+macOS may ask you to unlock Keychain or allow access. If Keychain is unavailable, automatic
+account entry stops. There is no plaintext password fallback or saved browser session.
+
+If Workday reports an existing account, the adapter opens Sign In and requests your existing
+password through a hidden terminal prompt once. Incorrect-password errors and unsupported
+forms stop automatic retries. You can complete sign-in manually in the same browser.
+With account automation enabled, the recognized Workday registration consent checkbox is
+checked automatically. Other agreements, CAPTCHA, email verification, and MFA remain manual
+handoffs; press Enter in the terminal after completing the step. The adapter does not read your inbox or reset passwords.
+Final application submission remains manual.
+
+On Workday's **Autofill with Resume** step, the filler uploads the default
+`~/.pocket-agent/resume.pdf` (or `--resume PATH`), waits for upload/processing to
+finish and Next to become enabled, then advances to the next page. An upload
+failure stops navigation. The known Workday wizard Next control is treated as
+navigation even when its HTML type is `submit`; final-review controls remain blocked.
+On subsequent Workday pages, the recognized **Save and Continue** control advances
+automatically after required fields are populated and pass browser validation.
+The filler waits for the active step to change, reads the new page, and stops at
+Review instead of clicking a final submission control.
+
+Supported URL families are HTTPS employer subdomains of `myworkdayjobs.com` and recruiting
+paths on `myworkdaysite.com`. Redirects to another site stop credential entry. This adapter
+is tested against local simulated Workday flows. Zebra's live registration and sign-in
+controls and consent handoff were inspected without creating an account; a complete
+live signup has not been tested. Custom domains, SSO, different button labels, and different password layouts
+may require manual authentication. Leave off `--workday-accounts` to keep the original
+manual login flow on any site.
 
 ### Form-suite results
 
@@ -90,6 +174,14 @@ The default job sources are the two SimplifyJobs lists:
 Both publish `.github/scripts/listings.json`. Pocket Agent uses that file. The README is only a fallback. Greenhouse (`boards-api.greenhouse.io`) and Lever (`api.lever.co`) are optional extra sources, one company board at a time.
 
 User data lives in `~/.pocket-agent/`. The repo ships a fictional profile and resume for Jordan Hale. That person is not real.
+
+Edit `~/.pocket-agent/profile.yaml` with your own details before filling applications.
+Each education entry can include `start: "YYYY-MM"` for enrollment and
+`graduation: "YYYY-MM"` for completion. Each experience entry uses `start` and
+`end` in the same format. In recognized education and work sections the filler
+extracts the year or month for separate date controls. Missing dates are asked,
+not inferred from graduation or degree length. Your upload defaults to
+`~/.pocket-agent/resume.pdf`; replace the sample PDF with your own resume.
 
 ## Quickstart
 

@@ -19,6 +19,8 @@ jobs:
           enable-cache: true
       - name: Install
         run: uv sync --extra dev
+      - name: Install Chromium
+        run: uv run playwright install --with-deps chromium
       - name: Unit tests
         run: uv run pytest
       - name: Eval smoke (mock backend)

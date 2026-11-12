@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 
 _MONTHS = {
     1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
@@ -39,6 +40,11 @@ _DEGREES = {
 _YES = {"yes", "y", "true"}
 _NO = {"no", "n", "false"}
 _EMPTY = {"", "select", "select one", "choose", "choose one", "—", "-"}
+# "Decline to self-identify", "I don't wish to answer", "Prefer not to say" are one answer.
+_DECLINE = re.compile(
+    r"\b(decline|prefer not|rather not|choose not|do not wish|don'?t wish|do not want to (answer|disclose|say)|don'?t want to (answer|disclose|say)|not wish to (answer|disclose|self))\b",
+    re.I,
+)
 
 
 def parse_date(value: str) -> tuple[int, int, int] | None:
@@ -100,7 +106,9 @@ def date_variants(value: str) -> list[str]:
 
 
 def _bucket(value: str) -> str:
-    text = value.strip().casefold().rstrip(".")
+    text = value.strip().casefold().rstrip(".").replace("’", "'")
+    if _DECLINE.search(text):
+        return "decline"
     if text in _YES or text.startswith("yes"):
         return "yes"
     if text in _NO or text.startswith("no"):
@@ -128,26 +136,82 @@ def _in_range(value: str, option: str) -> bool:
     return float(match.group(1)) <= number <= float(match.group(2))
 
 
+def _strip_dial_code(option: str) -> str:
+    """"United States +1" is the country, with the phone code on the end."""
+    return re.sub(r"\s*\(?\+\d{1,4}\)?\s*$", "", option)
+
+
 def resolve_option(value: str, options: list[str]) -> str | None:
     if not options:
         return None
+    # An answer that is literally one of the options wins before any yes/no bucketing ("Yes- Milpitas, CA only").
+    wanted = " ".join(value.split()).casefold()
+    for option in options:
+        if wanted and " ".join(option.split()).casefold() == wanted:
+            return option
     for option in options:
         if _in_range(value, option):
             return option
     target = _bucket(value)
+    compact = re.sub(r"[^a-z0-9]+", "", target)
     for option in options:
         if option.strip().casefold() in _EMPTY:
             continue
+        if _bucket(_strip_dial_code(option)) == target:
+            return option
         if _bucket(option) == target:
             return option
         if target and target in _bucket(option):
             return option
-    # "Texas" stored, option is "Texas (TX)".
+    # "United States" stored, option is "United States of America" (_bucket drops the spaces). Shortest wins
+    # over "United States Minor Outlying Islands".
+    if len(compact) >= 4:
+        hits = [option for option in options if compact in _bucket(_strip_dial_code(option))]
+        if hits:
+            return min(hits, key=len)
+    # "Texas" stored, option is "Texas (TX)". Whole words only: "US" is not in "Australia".
+    needle = value.strip().casefold()
     for option in options:
-        folded = option.casefold()
-        if value.strip().casefold() and value.strip().casefold() in folded:
+        if needle and re.search(r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])", option.casefold()):
             return option
     return None
+
+
+def _words(text: str) -> str:
+    text = re.sub(r"\([^)]*\)", " ", text.casefold())
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
+
+
+def closest_option(value: str, options: list[str]) -> str | None:
+    """Same words, different punctuation: "University of California, Los Angeles (UCLA)" vs "University of California - Los Angeles"."""
+    target = _words(value)
+    if not target:
+        return None
+    best_score, best = 0.0, None
+    for option in options:
+        words = _words(option)
+        if not words or words in _EMPTY:
+            continue
+        score = 1.0 if words == target else SequenceMatcher(None, target, words).ratio()
+        if score > best_score:
+            best_score, best = score, option
+    return best if best_score >= 0.92 else None
+
+
+def date_part(label: str, raw: str, *, named: bool) -> str | None:
+    """"2027-06" for a field labelled "End date year" is 2027; for "End date month" it is June."""
+    parsed = parse_date(raw)
+    if parsed is None:
+        return None
+    year, month, _day = parsed
+    has_year = bool(re.search(r"\byear\b", label, re.I))
+    has_month = bool(re.search(r"\bmonth\b", label, re.I))
+    if has_year == has_month:
+        # "Graduation month and year" is one field that takes the whole date.
+        return None
+    if has_year:
+        return str(year)
+    return _MONTHS[month] if named else f"{month:02d}"
 
 
 def equivalent(got: str, expected: str) -> bool:
