@@ -43,9 +43,14 @@ class Asked:
     key: str
     label: str
     question: str
+    kind: str = "text"
+    options: tuple[str, ...] = ()
+    sensitive: bool = False
+    section: str = ""
 
 
 AskFn = Callable[[Asked], UserAnswer]
+EventFn = Callable[[dict], None]
 
 
 @dataclass
@@ -74,8 +79,21 @@ class FormRun:
     status: str = "stopped"
 
 
-def fill_form(page, url: str, memory: Memory, resume_path: Path | None, ask: AskFn, llm=None, *, resume: bool = False) -> FormRun:
+def fill_form(
+    page,
+    url: str,
+    memory: Memory,
+    resume_path: Path | None,
+    ask: AskFn,
+    llm=None,
+    *,
+    resume: bool = False,
+    events: EventFn | None = None,
+    navigate: bool | None = None,
+) -> FormRun:
     """resume=True fills the page already open (after the user signed in by hand) instead of loading url."""
+    if navigate is not None:
+        resume = not navigate
     run = FormRun(url=url)
     try:
         page.set_default_timeout(8000)
@@ -86,6 +104,7 @@ def fill_form(page, url: str, memory: Memory, resume_path: Path | None, ask: Ask
             # The init script already counts submits on pages loaded since the first run; cover a page that predates it.
             page.evaluate(_RESUME_INIT)
         handled: set[tuple[str, str, int]] = set()
+        heading = ""
         for step_index in range(48):
             snap = _wait_ready(page) if step_index == 0 else extract_page(page)
             if snap.gate:
@@ -115,12 +134,16 @@ def fill_form(page, url: str, memory: Memory, resume_path: Path | None, ask: Ask
             snap = extract_page(page)
             field = _next_field(snap, handled)
             if field is not None:
+                if field.heading and field.heading != heading:
+                    heading = field.heading
+                    _emit(events, {"type": "step", "heading": heading})
                 try:
                     outcome = _decide_and_write(page, field, memory, resume_path, ask, llm, run, snapshot=snap)
                 except Exception as exc:  # noqa: BLE001 — one stuck widget should not end the whole page
                     outcome = _outcome(field, None, "error", type(exc).__name__, asked=False, from_memory=False)
                 handled.add((field.section, field.label.casefold(), field.group))
                 run.outcomes.append(outcome)
+                _emit(events, _activity_event(memory, outcome, field.heading))
                 if field.kind == "file" and outcome.action == "error":
                     run.error = "Resume upload did not complete; stopped before advancing."
                     break
@@ -145,7 +168,49 @@ def fill_form(page, url: str, memory: Memory, resume_path: Path | None, ask: Ask
             run.submits = max(run.submits, 1)
     except Exception as exc:  # noqa: BLE001 — the eval harness records crashes per form
         run.error = f"{type(exc).__name__}: {exc}"
+    counts = review_counts(run.outcomes)
+    if run.gate:
+        _emit(events, {"type": "gate", "gate": run.gate, **counts, "submits": run.submits})
+    elif run.error:
+        _emit(events, {"type": "error", "message": run.error})
+    else:
+        _emit(events, {"type": "review", **counts, "submits": run.submits})
     return run
+
+
+def review_counts(outcomes: list[FieldOutcome]) -> dict[str, int]:
+    filled = sum(1 for item in outcomes if item.action == "fill" and item.value and not item.asked)
+    asked = sum(1 for item in outcomes if item.asked)
+    skipped = sum(1 for item in outcomes if item.action == "skip")
+    return {"filled": filled, "asked": asked, "skipped": skipped}
+
+
+def activity_source(memory: Memory, outcome: FieldOutcome) -> str:
+    if outcome.via_model:
+        return "model"
+    if outcome.asked:
+        return "answer"
+    entry = memory.get(outcome.key) if outcome.key else None
+    if entry is not None and entry.source == "resume":
+        return "resume"
+    return "memory"
+
+
+def _emit(events: EventFn | None, payload: dict) -> None:
+    if events is not None:
+        events(payload)
+
+
+def _activity_event(memory: Memory, outcome: FieldOutcome, heading: str) -> dict:
+    return {
+        "type": "activity",
+        "label": outcome.label,
+        "action": outcome.action,
+        "value": outcome.value,
+        "source": activity_source(memory, outcome),
+        "heading": heading,
+        "asked": outcome.asked,
+    }
 
 
 def _wait_ready(page, settle_ms: int = 12000) -> PageSnapshot:
@@ -309,7 +374,7 @@ def _decide_and_write(page, field: ExtractedField, memory: Memory, resume_path, 
             return _outcome(field, key, "fill", written, asked=False, from_memory=True, via_model=agreed)
         if field.required:
             return _ask_or_saved(page, field, memory, resume_path, ask, key or _label_key(field))
-    if field.value and not is_blank(field.value):
+    if field.required and field.value and not is_blank(field.value):
         return _outcome(field, key, "keep", field.value, asked=False, from_memory=False)
     if field.required:
         return _ask_or_saved(page, field, memory, resume_path, ask, key or _label_key(field))
@@ -341,7 +406,11 @@ def _ask_or_saved(page, field, memory, resume_path, ask, key: str) -> FieldOutco
         offered = _peek_dropdown(page, field)
         if 0 < len(offered) <= 15:
             question += " Options: " + " / ".join(offered)
-    answer = ask(Asked(key, field.label, question))
+    answer = ask(Asked(
+        key, field.label, question, kind=field.kind,
+        options=tuple(option["label"] for option in getattr(field, "options", ()) if option.get("label")),
+        sensitive=sensitive, section=getattr(field, "heading", "") or field.section,
+    ))
     if answer.skip:
         return _outcome(field, key, "skip", "", asked=False, from_memory=False)
     memory.put(

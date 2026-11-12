@@ -16,7 +16,7 @@ from pocket_agent.forms.hard_catalog import HARD_FORMS
 from pocket_agent.forms.server import FormServer
 from pocket_agent.ui.app import create_app
 
-ARTIFACTS = Path("/opt/cursor/artifacts")
+ARTIFACTS = Path(__file__).resolve().parents[1] / ".pytest_cache" / "ui-artifacts"
 
 
 def _free_port() -> int:
