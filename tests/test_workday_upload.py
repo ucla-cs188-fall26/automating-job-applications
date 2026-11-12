@@ -92,7 +92,10 @@ def test_live_workday_layout_hidden_sibling_input_and_completed_step_label(tmp_p
             page = browser.new_page()
             page.route('**/*', lambda route: route.fulfill(body=html, content_type='text/html'))
             result = fill_form(page, URL, memory, resume, lambda _: pytest.fail('Unexpected prompt'))
-            assert result.error is None, result.error
+            # This fixture ends at step 2 with no forward navigation.
+            assert result.status == "blocked"
+            assert result.current_step == "current step 2 of 8 My Information"
+            assert "did not advance" in (result.error or "")
             assert page.evaluate('window.uploads') == 1
             assert page.evaluate('window.nextClicks') == 1
             assert page.locator('input').input_value() == 'Jordan'

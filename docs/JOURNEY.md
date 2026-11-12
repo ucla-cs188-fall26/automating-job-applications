@@ -230,3 +230,9 @@ Non-exact matches are sent to the model. If it names another key, the keyword al
 | Hard | 4B Q4 | 31/31 | 22/22 | 0 | 20 | 6.5 | 50.3 s | 5156 MB |
 
 Asks were complete on every row, submits were 0, repeat-asks were 0, and crashes were 0. The hard held-out bar is met by `none` and by all three GGUF sizes. 0.6B is the smallest GGUF that meets it. `none` also meets it. Real pages and a Mac were not tested.
+
+## 2026-11-04 — Local chat desk
+
+`main` stayed at `9e410a3`. The desk is on branch `ui`. `pocket-agent ui` listens on `127.0.0.1:8765` only and opens a browser. The page, styles, and script are one file served by FastAPI. Nothing is loaded from a CDN.
+
+Start pastes an application link. The existing `fill_form` runs in a second Chromium window, headed unless the background toggle is on. Each field is streamed to an activity list with its step, value, and source (resume, memory, model, or answer). Questions are chat bubbles: text, a dropdown, yes/no buttons, a date, or a larger box for an essay. "Remember this" starts checked, and starts unchecked for sensitive answers. Review shows the filled, asked, and skipped counts and tells the user to click Submit in the form window. A login wall or a CAPTCHA pauses and waits for Continue. My answers edits the profile, replaces the resume, and edits or deletes memory rows. Settings lists the GGUF files and the model size. `pocket-agent fill` is unchanged.

@@ -157,6 +157,11 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--interactive", dest="unattended", action="store_false", help="Ask for missing answers, overriding the saved unattended setting")
     fill.set_defaults(func=cmd_fill)
 
+    ui = sub.add_parser("ui", help="Open the local form desk in a browser")
+    ui.add_argument("--port", type=int, default=8765)
+    ui.add_argument("--no-open", action="store_true", help="Do not open a browser window")
+    ui.set_defaults(func=cmd_ui)
+
     eval_forms = sub.add_parser("eval-forms", help="Score the local fictional application suite")
     eval_forms.add_argument("--suite", choices=["easy", "hard", "both"], default="easy")
     eval_forms.add_argument("--runs", type=int, default=1)
@@ -465,6 +470,22 @@ def cmd_eval(args: argparse.Namespace) -> int:
         print(f"wrote {args.out}")
     if report.get("failed_threshold"):
         return 1
+    return 0
+
+
+def cmd_ui(args: argparse.Namespace) -> int:
+    import threading
+    import webbrowser
+
+    import uvicorn
+
+    from pocket_agent.ui.app import create_app
+
+    host = "127.0.0.1"
+    app = create_app()
+    if not args.no_open:
+        threading.Timer(0.6, lambda: webbrowser.open(f"http://{host}:{args.port}")).start()
+    uvicorn.run(app, host=host, port=args.port, log_level="info")
     return 0
 
 

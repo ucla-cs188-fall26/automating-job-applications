@@ -20,7 +20,7 @@ class Memory:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        self._db = sqlite3.connect(path)
+        self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(
             """
@@ -84,6 +84,17 @@ class Memory:
     def has_value(self, key: str) -> bool:
         entry = self.get(key)
         return entry is not None and entry.value.strip() != ""
+
+    def all_entries(self) -> list[MemoryEntry]:
+        rows = self._db.execute(
+            "SELECT key, value, always_use, sensitive, source FROM entries ORDER BY key"
+        ).fetchall()
+        return [MemoryEntry(row[0], row[1], bool(row[2]), bool(row[3]), row[4]) for row in rows]
+
+    def delete(self, key: str) -> None:
+        self._db.execute("DELETE FROM entries WHERE key = ?", (key,))
+        self._db.execute("DELETE FROM synonyms WHERE key = ?", (key,))
+        self._db.commit()
 
     def keys(self) -> list[str]:
         return [row[0] for row in self._db.execute("SELECT key FROM entries ORDER BY key")]

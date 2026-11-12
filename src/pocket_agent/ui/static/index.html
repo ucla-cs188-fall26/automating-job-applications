@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pocket Agent</title>
+<style>
+  :root {
+    --bg: #f3efe6;
+    --paper: #fffdf8;
+    --ink: #1c1916;
+    --muted: #6f675f;
+    --line: #e3d9cc;
+    --green: #1c6b45;
+    --green-soft: #e6f3eb;
+    --amber: #f6ead3;
+    --danger: #8d2f2f;
+    --shadow: 0 10px 30px rgba(40, 28, 16, 0.06);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.45 "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    align-items: center;
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid var(--line);
+    background: var(--paper);
+  }
+  header strong { font-size: 1.15rem; letter-spacing: 0.01em; }
+  header p { margin: 0.15rem 0 0; color: var(--muted); font-size: 0.92rem; }
+  nav { display: flex; gap: 0.4rem; }
+  nav button, button, input, select, textarea {
+    font: inherit;
+  }
+  nav button {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    padding: 0.4rem 0.8rem;
+    cursor: pointer;
+  }
+  nav button[aria-current="page"] {
+    background: var(--green-soft);
+    border-color: #b7dcc6;
+    color: var(--green);
+  }
+  main { max-width: 1100px; margin: 0 auto; padding: 1.25rem; }
+  .layout { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 1rem; }
+  @media (max-width: 800px) {
+    .layout { grid-template-columns: 1fr; }
+    header { align-items: flex-start; flex-direction: column; }
+  }
+  .card {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    box-shadow: var(--shadow);
+    padding: 1rem;
+  }
+  label.field { display: block; font-size: 0.92rem; color: var(--muted); margin-bottom: 0.35rem; }
+  .row { display: flex; gap: 0.5rem; }
+  input[type="url"], input[type="text"], input[type="email"], input[type="date"], select, textarea {
+    width: 100%;
+    border: 1px solid var(--line);
+    background: white;
+    border-radius: 10px;
+    padding: 0.65rem 0.75rem;
+  }
+  textarea { min-height: 8rem; resize: vertical; }
+  button.primary {
+    background: var(--green);
+    color: white;
+    border: 0;
+    border-radius: 10px;
+    padding: 0.65rem 1rem;
+    cursor: pointer;
+  }
+  button.ghost, button.choice {
+    background: white;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 0.55rem 0.8rem;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.55; cursor: default; }
+  #status { min-height: 1.4rem; color: var(--muted); margin: 0.75rem 0; }
+  .bubble {
+    background: white;
+    border: 1px solid var(--line);
+    border-radius: 14px 14px 14px 4px;
+    padding: 0.9rem;
+    margin: 0.6rem 0;
+  }
+  .bubble h3 { margin: 0 0 0.4rem; font-size: 1rem; }
+  .choices { display: flex; gap: 0.4rem; flex-wrap: wrap; margin: 0.5rem 0; }
+  .check { display: flex; gap: 0.45rem; align-items: center; color: var(--muted); font-size: 0.92rem; margin: 0.55rem 0; }
+  #review {
+    background: var(--green-soft);
+    border: 1px solid #b7dcc6;
+    border-radius: 16px;
+    padding: 1rem;
+    margin-top: 0.8rem;
+  }
+  #review h2 { margin: 0 0 0.35rem; font-size: 1.2rem; }
+  #gate {
+    background: var(--amber);
+    border-radius: 16px;
+    padding: 1rem;
+    margin-top: 0.8rem;
+  }
+  .step { margin-top: 0.8rem; }
+  .step h3 { margin: 0 0 0.35rem; font-size: 0.95rem; color: var(--muted); font-weight: 600; }
+  .item {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.2rem 0.6rem;
+    padding: 0.45rem 0;
+    border-top: 1px solid var(--line);
+    font-size: 0.95rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    border-radius: 999px;
+    padding: 0.1rem 0.45rem;
+    background: var(--amber);
+  }
+  .tag.resume { background: var(--green-soft); color: var(--green); }
+  .tag.memory { background: #ece7df; }
+  .tag.model { background: #f3e1c2; }
+  .tag.answer { background: #e7eef8; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.45rem 0.2rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .screen { display: none; }
+  .screen.active { display: block; }
+  .warn { color: var(--danger); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <strong>Pocket Agent</strong>
+    <p>Fills the form. You click Submit.</p>
+  </div>
+  <nav>
+    <button type="button" data-screen="chat" aria-current="page">Chat</button>
+    <button type="button" data-screen="answers">My answers</button>
+    <button type="button" data-screen="settings">Settings</button>
+  </nav>
+</header>
+<main>
+  <section id="chat" class="screen active">
+    <div class="layout">
+      <div class="card">
+        <label class="field" for="url">Application link</label>
+        <div class="row">
+          <input id="url" type="url" placeholder="https://jobs.example/apply" autocomplete="off">
+          <button id="start" class="primary" type="button">Start</button>
+        </div>
+        <label class="check"><input id="headless" type="checkbox"> Run the form window in the background</label>
+        <p id="status">Paste a link. The form opens in its own window.</p>
+        <div id="transcript"></div>
+        <div id="gate" hidden>
+          <h2>Sign in to continue</h2>
+          <p id="gate-copy">Sign in in the browser window, then continue. Pocket Agent will not type a password.</p>
+          <button id="continue" class="primary" type="button">Continue</button>
+        </div>
+        <div id="review" hidden>
+          <h2 id="review-title">Review</h2>
+          <p id="review-counts"></p>
+          <p id="review-message">Review the form in the browser window and click Submit yourself.</p>
+        </div>
+      </div>
+      <aside class="card">
+        <h2 style="margin:0 0 0.4rem; font-size:1.05rem;">Activity</h2>
+        <div id="activity"></div>
+      </aside>
+    </div>
+  </section>
+  <section id="answers" class="screen">
+    <div class="card">
+      <h2 style="margin-top:0;">Profile</h2>
+      <form id="profile-form">
+        <label class="field" for="pname">Name</label>
+        <input id="pname" type="text">
+        <label class="field" for="pemail">Email</label>
+        <input id="pemail" type="email">
+        <label class="field" for="pphone">Phone</label>
+        <input id="pphone" type="text">
+        <label class="field" for="pcity">City</label>
+        <input id="pcity" type="text">
+        <label class="field" for="pregion">Region</label>
+        <input id="pregion" type="text">
+        <p><button class="primary" type="submit">Save profile</button></p>
+      </form>
+      <h2>Resume</h2>
+      <input id="resume-file" type="file" accept=".pdf,.txt,.md">
+      <pre id="resume-preview" style="white-space:pre-wrap;"></pre>
+      <h2>Saved answers</h2>
+      <div id="memory-list"></div>
+    </div>
+  </section>
+  <section id="settings" class="screen">
+    <div class="card">
+      <h2 style="margin-top:0;">Model</h2>
+      <label class="field" for="model">Size</label>
+      <select id="model">
+        <option value="0.6b">0.6B (default)</option>
+        <option value="1.7b">1.7B</option>
+        <option value="4b">4B</option>
+        <option value="none">None</option>
+      </select>
+      <div id="model-files"></div>
+      <p><button id="save-settings" class="primary" type="button">Save settings</button></p>
+    </div>
+  </section>
+</main>
+<script>
+const state = { settings: { model: "0.6b", headless: false }, socket: null, step: null };
+
+function show(name) {
+  document.querySelectorAll(".screen").forEach((el) => el.classList.toggle("active", el.id === name));
+  document.querySelectorAll("nav button").forEach((btn) => {
+    btn.setAttribute("aria-current", btn.dataset.screen === name ? "page" : "false");
+  });
+  if (name === "answers") loadAnswers();
+  if (name === "settings") renderModels();
+}
+
+document.querySelectorAll("nav button").forEach((btn) => btn.addEventListener("click", () => show(btn.dataset.screen)));
+
+function connect() {
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${protocol}://${location.host}/ws`);
+  state.socket = socket;
+  socket.addEventListener("message", (event) => onEvent(JSON.parse(event.data)));
+}
+
+function send(payload) {
+  state.socket.send(JSON.stringify(payload));
+}
+
+function onEvent(event) {
+  if (event.type === "status") {
+    document.getElementById("status").textContent = event.text;
+  } else if (event.type === "step") {
+    addStep(event.heading);
+  } else if (event.type === "activity") {
+    if (event.heading && event.heading !== state.step) addStep(event.heading);
+    addActivity(event);
+  } else if (event.type === "ask") {
+    document.getElementById("status").textContent = "Waiting for your answer.";
+    showBubble(event);
+  } else if (event.type === "gate") {
+    const box = document.getElementById("gate");
+    box.hidden = false;
+    const copy = document.getElementById("gate-copy");
+    copy.textContent = event.gate === "captcha"
+      ? "Complete the check in the browser window, then continue. Pocket Agent will not solve it."
+      : "Sign in in the browser window, then continue. Pocket Agent will not type a password.";
+    document.getElementById("status").textContent = "Paused.";
+    document.getElementById("start").disabled = false;
+  } else if (event.type === "review") {
+    const box = document.getElementById("review");
+    box.hidden = false;
+    box.dataset.submits = String(event.submits || 0);
+    document.getElementById("review-counts").textContent = `${event.filled} filled, ${event.asked} asked, ${event.skipped} skipped.`;
+    document.getElementById("status").textContent = "Stopped before submit.";
+    document.getElementById("start").disabled = false;
+  } else if (event.type === "error") {
+    document.getElementById("status").textContent = event.message;
+    document.getElementById("start").disabled = false;
+  }
+}
+
+function addStep(heading) {
+  state.step = heading;
+  const block = document.createElement("div");
+  block.className = "step";
+  const title = document.createElement("h3");
+  title.textContent = heading || "Form";
+  block.appendChild(title);
+  document.getElementById("activity").appendChild(block);
+}
+
+function addActivity(event) {
+  let step = document.querySelector("#activity .step:last-child");
+  if (!step) addStep(event.heading || "Form");
+  step = document.querySelector("#activity .step:last-child");
+  const row = document.createElement("div");
+  row.className = "item";
+  const label = document.createElement("div");
+  const action = event.asked ? "asked" : event.action;
+  label.textContent = `${event.label || "Field"} · ${action}${event.value ? ": " + event.value : ""}`;
+  const tag = document.createElement("span");
+  tag.className = `tag ${event.source || ""}`;
+  tag.textContent = event.source || action;
+  row.append(label, tag);
+  step.appendChild(row);
+}
+
+function showBubble(event) {
+  const host = document.getElementById("transcript");
+  const bubble = document.createElement("form");
+  bubble.className = "bubble";
+  const title = document.createElement("h3");
+  title.textContent = event.question;
+  bubble.appendChild(title);
+  const options = event.options || [];
+  const yesNo = options.length === 2 && options.every((item) => /^(yes|no)$/i.test(item));
+  let control;
+  if (yesNo) {
+    const wrap = document.createElement("div");
+    wrap.className = "choices";
+    options.forEach((option) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "choice";
+      button.textContent = option;
+      button.addEventListener("click", () => submitAnswer(option, bubble));
+      wrap.appendChild(button);
+    });
+    bubble.appendChild(wrap);
+  } else if (options.length) {
+    control = document.createElement("select");
+    control.id = "answer";
+    options.forEach((option) => {
+      const item = document.createElement("option");
+      item.value = option;
+      item.textContent = option;
+      control.appendChild(item);
+    });
+    bubble.appendChild(control);
+  } else if (event.kind === "textarea" || event.key === "essay" || event.key === "cover_letter") {
+    control = document.createElement("textarea");
+    control.id = "answer";
+  } else if (event.kind === "date") {
+    control = document.createElement("input");
+    control.type = "date";
+    control.id = "answer";
+  } else {
+    control = document.createElement("input");
+    control.type = "text";
+    control.id = "answer";
+  }
+  if (control) bubble.appendChild(control);
+  const remember = document.createElement("label");
+  remember.className = "check";
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.id = "remember";
+  box.checked = Boolean(event.remember);
+  remember.append(box, document.createTextNode(event.sensitive ? "Remember this (off for sensitive answers)" : "Remember this"));
+  bubble.appendChild(remember);
+  if (!yesNo) {
+    const send = document.createElement("button");
+    send.className = "primary";
+    send.type = "submit";
+    send.id = "send-answer";
+    send.textContent = "Send";
+    bubble.appendChild(send);
+    bubble.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      submitAnswer(control.value, bubble);
+    });
+  }
+  host.appendChild(bubble);
+  if (control) control.focus();
+}
+
+function submitAnswer(value, bubble) {
+  const remember = bubble.querySelector("#remember").checked;
+  send({ type: "answer", value, remember });
+  bubble.querySelectorAll("button, input, select, textarea").forEach((el) => { el.disabled = true; });
+}
+
+document.getElementById("start").addEventListener("click", () => {
+  document.getElementById("transcript").replaceChildren();
+  document.getElementById("activity").replaceChildren();
+  document.getElementById("review").hidden = true;
+  document.getElementById("gate").hidden = true;
+  state.step = null;
+  document.getElementById("start").disabled = true;
+  document.getElementById("status").textContent = "Starting.";
+  send({
+    type: "start",
+    url: document.getElementById("url").value.trim(),
+    headless: document.getElementById("headless").checked,
+    model: document.getElementById("model").value,
+  });
+});
+
+document.getElementById("continue").addEventListener("click", () => {
+  document.getElementById("gate").hidden = true;
+  send({ type: "continue", headless: document.getElementById("headless").checked, model: document.getElementById("model").value });
+});
+
+async function loadSettings() {
+  const response = await fetch("/api/settings");
+  state.settings = await response.json();
+  document.getElementById("model").value = state.settings.model;
+  document.getElementById("headless").checked = state.settings.headless;
+  renderModels();
+}
+
+function renderModels() {
+  const host = document.getElementById("model-files");
+  host.replaceChildren();
+  (state.settings.models || []).forEach((item) => {
+    const line = document.createElement("p");
+    const size = item.bytes ? `${Math.round(item.bytes / 1000000)} MB on disk` : "not downloaded";
+    line.textContent = `${item.size}: ${item.file} — ${item.present ? size : "not downloaded"}`;
+    host.appendChild(line);
+  });
+}
+
+document.getElementById("save-settings").addEventListener("click", async () => {
+  const response = await fetch("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: document.getElementById("model").value, headless: document.getElementById("headless").checked }),
+  });
+  state.settings = await response.json();
+  renderModels();
+});
+
+async function loadAnswers() {
+  const [profile, memory, resume] = await Promise.all([
+    fetch("/api/profile").then((res) => res.json()),
+    fetch("/api/memory").then((res) => res.json()),
+    fetch("/api/resume").then((res) => res.json()),
+  ]);
+  document.getElementById("pname").value = profile.name || "";
+  document.getElementById("pemail").value = profile.email || "";
+  document.getElementById("pphone").value = profile.phone || "";
+  document.getElementById("pcity").value = profile.city || "";
+  document.getElementById("pregion").value = profile.region || "";
+  document.getElementById("resume-preview").textContent = (resume.lines || []).slice(0, 12).join("\n");
+  const host = document.getElementById("memory-list");
+  host.replaceChildren();
+  const table = document.createElement("table");
+  (memory.entries || []).forEach((entry) => {
+    const row = document.createElement("tr");
+    const key = document.createElement("td");
+    key.textContent = entry.key;
+    const valueCell = document.createElement("td");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = entry.value;
+    valueCell.appendChild(input);
+    const actions = document.createElement("td");
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "ghost";
+    save.textContent = "Save";
+    save.addEventListener("click", async () => {
+      await fetch(`/api/memory/${encodeURIComponent(entry.key)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: input.value, always_use: entry.always_use }),
+      });
+    });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "ghost";
+    remove.textContent = "Delete";
+    remove.addEventListener("click", async () => {
+      await fetch(`/api/memory/${encodeURIComponent(entry.key)}`, { method: "DELETE" });
+      loadAnswers();
+    });
+    actions.append(save, remove);
+    row.append(key, valueCell, actions);
+    table.appendChild(row);
+  });
+  host.appendChild(table);
+}
+
+document.getElementById("profile-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await fetch("/api/profile", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: document.getElementById("pname").value,
+      email: document.getElementById("pemail").value,
+      phone: document.getElementById("pphone").value,
+      city: document.getElementById("pcity").value,
+      region: document.getElementById("pregion").value,
+    }),
+  });
+});
+
+document.getElementById("resume-file").addEventListener("change", async () => {
+  const file = document.getElementById("resume-file").files[0];
+  if (!file) return;
+  const body = new FormData();
+  body.append("file", file);
+  const response = await fetch("/api/resume", { method: "POST", body });
+  const parsed = await response.json();
+  document.getElementById("resume-preview").textContent = (parsed.lines || []).slice(0, 12).join("\n");
+});
+
+connect();
+loadSettings();
+</script>
+</body>
+</html>
