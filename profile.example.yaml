@@ -1,0 +1,98 @@
+# Blank template. Fill in your facts before using this as a live profile.
+# The filler reads ~/.pocket-agent/profile.yaml by default, not this file.
+# Required to pass validation: name, education[].school, education[].degree.
+# Complete the eligibility and location flags too; blank/null is not a safe
+# substitute for an answer because some code interprets it as false.
+# Never put API keys or account passwords in this file.
+
+schema_version: 1
+name: ""
+email: ""
+phone: ""
+
+# Contact/address fallback when these facts are absent from the resume.
+personal:
+  email: ""
+  phone: ""
+  address_line_1: ""
+  address_line_2: ""
+  city: ""
+  region: ""
+  postal_code: ""
+  county: ""
+  country: ""
+
+location:
+  city: ""
+  region: ""
+  country: ""                 # Country code, e.g. US
+  willing_to_relocate: null    # Replace with true or false
+  remote_ok: null              # Replace with true or false
+
+education:
+  - school: ""
+    degree: ""                # e.g. BS, MS
+    field: ""
+    start: ""                 # YYYY-MM
+    graduation: ""            # YYYY-MM
+    gpa: ""                   # Optional
+
+citizenship:
+  country: ""                 # Citizenship country code
+  authorized_to_work: []       # Country codes where you are authorized to work
+  permanent_residence: []      # Country codes, if applicable
+  requires_sponsorship: null   # Replace with true or false
+  clearance: ""               # Your actual clearance, or "none"
+
+# Remove empty entries; add one entry per job. Dates use YYYY-MM.
+experience:
+  - title: ""
+    org: ""
+    start: ""
+    end: ""
+    highlights: []             # Concrete accomplishments; do not invent metrics
+
+# Optional evidence for AI-written answers; not a dedicated form-field mapping.
+projects:
+  - name: ""
+    description: ""
+    technologies: []
+    highlights: []
+    url: ""
+
+skills:
+  languages: []
+  frameworks: []
+  tools: []
+
+preferences:
+  roles: []
+  locations: []
+  target_start: ""             # YYYY-MM; specific availability may still be asked
+
+links:
+  github: ""
+  linkedin: ""
+  portfolio: ""
+
+constraints:
+  exclude_companies: []
+  notes: ""
+
+# Supply explicit answers, then set always_use: true to reuse them.
+# Empty values are ignored. Use the site's option wording where possible.
+# Race and Hispanic/Latino identity are separate self-identification answers.
+# A reusable salary target overrides AI market research.
+form_answers:
+  how_did_you_hear: ""
+  phone_device_type: ""
+  gender: {value: "", always_use: false}
+  race: {value: "", always_use: false}
+  hispanic: {value: "", always_use: false}
+  pronouns: {value: "", always_use: false}
+  veteran_status: {value: "", always_use: false}
+  disability_status: {value: "", always_use: false}
+  salary_expectation: {value: "", always_use: false}  # Annual base target
+  available_start: {value: "", always_use: false}     # e.g. YYYY-MM-DD
+  onsite: {value: "", always_use: false}
+  office_choice: {value: "", always_use: false}

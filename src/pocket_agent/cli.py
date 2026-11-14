@@ -149,12 +149,14 @@ def main(argv: list[str] | None = None) -> int:
 
     fill = sub.add_parser("fill", help="Fill an application form in the browser and stop before submit")
     fill.add_argument("url")
-    fill.add_argument("--model", default="0.6b", choices=["none", "0.6b", "1.7b", "4b"])
+    fill.add_argument("--model", default="gpt", choices=["none", "gpt", "claude"], help="Hosted AI provider (API key and POCKET_AGENT_AI_MODEL required)")
     fill.add_argument("--resume", type=Path)
     fill.add_argument("--workday-accounts", action="store_true", help="Create/sign in to Workday accounts using macOS Keychain")
     mode = fill.add_mutually_exclusive_group()
     mode.add_argument("--unattended", dest="unattended", action="store_true", default=None, help="Never prompt in the terminal; use saved answers and report unresolved fields")
     mode.add_argument("--interactive", dest="unattended", action="store_false", help="Ask for missing answers, overriding the saved unattended setting")
+    fill.add_argument("--headless", action="store_true", help="Run without a visible browser")
+    fill.add_argument("--close-on-finish", action="store_true", help="Close the browser after writing the result")
     fill.set_defaults(func=cmd_fill)
 
     ui = sub.add_parser("ui", help="Open the local form desk in a browser")
@@ -493,7 +495,7 @@ def cmd_fill(args: argparse.Namespace) -> int:
     from playwright.sync_api import sync_playwright
 
     from pocket_agent.forms.engine import Asked, UserAnswer, fill_form
-    from pocket_agent.forms.llm import LocalDecider
+    from pocket_agent.forms.cloud import create_decider
     from pocket_agent.forms.memory import Memory
     from pocket_agent.forms.policy import is_sensitive_key
     from pocket_agent.forms.seed import seed_memory
@@ -506,7 +508,7 @@ def cmd_fill(args: argparse.Namespace) -> int:
         print("No profile yet. Run `pocket-agent init` first.")
         return 1
     profile = load_profile(profile_path)
-    resume = args.resume or (home / "resume.pdf")
+    resume = Path(args.resume or load_config().get("resume_path") or (home / "resume.pdf"))
     if resume.exists():
         from pocket_agent.resume import resume_contact_profile
         try:
@@ -537,10 +539,8 @@ def cmd_fill(args: argparse.Namespace) -> int:
             return 1
     memory = Memory(home / "forms.sqlite")
     seed_memory(memory, profile, resume_path=str(resume) if resume.exists() else "")
-    decider = None if args.model == "none" else LocalDecider(args.model)
-    if decider is not None and not decider.available:
-        print(f"Form model fallback is off ({decider.error}). Known fields still fill from memory.")
-        decider = None
+    resume_text = parse_resume(resume).get("text", "") if args.model != "none" and resume.exists() else ""
+    decider = create_decider(args.model, profile, resume_text)
 
     unresolved: list[str] = []
 
@@ -550,21 +550,23 @@ def cmd_fill(args: argparse.Namespace) -> int:
                 unresolved.append(asked.label)
             return UserAnswer("", skip=True)
         print(asked.question)
-        value = input("> ").strip()
+        value = input("> (type /skip to leave blank) ").strip()
+        if value.casefold() == "/skip":
+            return UserAnswer("", skip=True)
         always = False
         if is_sensitive_key(asked.key):
             always = input("Always use this answer on future forms? [y/N] ").strip().lower() == "y"
         return UserAnswer(value, always)
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=False)
+        browser = playwright.chromium.launch(headless=getattr(args, "headless", False))
         page = browser.new_page()
         resume_file = resume if resume.exists() else None
         runs = [fill_form(page, args.url, memory, resume_file, ask, decider)]
         # The opt-in adapter handles only recognized Workday account controls.
-        while runs[-1].gate and not runs[-1].error and not runs[-1].submits and len(runs) <= 20:
+        while (runs[-1].gate or runs[-1].error or runs[-1].status != "review") and not runs[-1].submits and len(runs) <= 20:
             account_message = False
-            if accounts is not None:
+            if accounts is not None and runs[-1].gate and not runs[-1].error:
                 try:
                     step = accounts.step(page, runs[-1].gate)
                 except Exception as exc:
@@ -579,7 +581,7 @@ def cmd_fill(args: argparse.Namespace) -> int:
                         runs.append(fill_form(page, args.url, memory, resume_file, ask, decider, resume=True))
                         continue
             if not account_message:
-                print(_GATE_HELP.get(runs[-1].gate, f"Stopped at a {runs[-1].gate} page."))
+                print(runs[-1].error or _GATE_HELP.get(runs[-1].gate, "Application has not reached Review. Check the current page."))
             if args.unattended:
                 break
             print("After completing the indicated step, press Enter to continue (or type q to stop).")
@@ -588,25 +590,28 @@ def cmd_fill(args: argparse.Namespace) -> int:
                     break
             except EOFError:
                 break
-            runs.append(fill_form(page, args.url, memory, resume_file, ask, decider, resume=True))
+            runs.append(fill_form(page, args.url, memory, resume_file, ask, decider, resume=True, preserve_existing=True))
         run = runs[-1]
         run.outcomes = [outcome for item in runs for outcome in item.outcomes]
         run.submits = max(item.submits for item in runs)
+        ai_stats = decider.backend.stats() if decider is not None else {"attempted": 0, "responses_received": 0, "completed": 0, "failed": 0}
+        print(decider.backend.summary() if decider is not None else "[AI] Disabled. Requests attempted: 0.")
         if args.unattended:
             import json
             report_path = home / "last-fill-report.json"
-            report_path.write_text(json.dumps({"url": args.url, "status": run.status, "current_step": run.current_step, "gate": run.gate, "error": run.error, "unresolved": unresolved, "submits": run.submits}, indent=2))
+            report_path.write_text(json.dumps({"url": args.url, "status": run.status, "current_step": run.current_step, "gate": run.gate, "error": run.error, "unresolved": list(dict.fromkeys(unresolved + run.unresolved)), "validation_errors": run.validation_errors, "resume_path": str(resume), "submits": run.submits, "ai": ai_stats}, indent=2))
             print(f"Unattended run {run.status}. Current step: {run.current_step or 'unknown'}. Unresolved fields: {len(unresolved)}. Report: {report_path}")
             if run.error:
                 print(run.error)
             for label in unresolved:
                 print(f"needs answer: {label}")
             print("Browser left open for review. Close the browser window to exit.")
-            try:
-                page.wait_for_event("close", timeout=0)
-            except Exception:
-                pass
-        elif not run.gate and not run.error:
+            if not (getattr(args, "headless", False) or getattr(args, "close_on_finish", False)):
+                try:
+                    page.wait_for_event("close", timeout=0)
+                except Exception:
+                    pass
+        elif not run.gate and not run.error and not getattr(args, "close_on_finish", False) and not getattr(args, "headless", False):
             print("Stopped before submit. Review the browser window and submit it yourself, then press Enter to close it.")
             try:
                 input()
@@ -615,7 +620,7 @@ def cmd_fill(args: argparse.Namespace) -> int:
         browser.close()
     memory.close()
     _print_fill(run)
-    if args.unattended and (run.gate or unresolved) and not run.submits and not run.error:
+    if args.unattended and (run.status != "review" or run.gate or unresolved) and not run.submits and not run.error:
         return 2
     return 1 if run.submits or run.error else 0
 

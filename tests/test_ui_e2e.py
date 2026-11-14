@@ -14,7 +14,7 @@ from playwright.sync_api import sync_playwright
 from pocket_agent.forms.catalog import FORMS
 from pocket_agent.forms.hard_catalog import HARD_FORMS
 from pocket_agent.forms.server import FormServer
-from pocket_agent.ui.app import create_app
+from pocket_agent.ui.app import SettingsIn, create_app, save_settings
 
 ARTIFACTS = Path(__file__).resolve().parents[1] / ".pytest_cache" / "ui-artifacts"
 
@@ -79,6 +79,7 @@ def test_three_forms_through_the_desk(tmp_path, monkeypatch) -> None:
     forms.start()
     port = _free_port()
     app = create_app()
+    save_settings(SettingsIn(model="none", headless=True))
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None  # type: ignore[method-assign]

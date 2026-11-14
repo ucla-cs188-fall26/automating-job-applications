@@ -40,7 +40,7 @@ def _settings_profile_and_memory(client: TestClient) -> None:
     assert page.status_code == 200
     assert b"click Submit yourself" in page.content
     settings = client.get("/api/settings").json()
-    assert settings["model"] == "0.6b"
+    assert settings["model"] == "gpt"
     assert settings["headless"] is False
     saved = client.put("/api/settings", json={"model": "none", "headless": True}).json()
     assert saved["model"] == "none"

@@ -60,3 +60,26 @@ def test_optional_existing_text_is_preserved(tmp_path):
             browser.close()
     finally:
         memory.close()
+
+
+@pytest.mark.parametrize('label', ['Gender', 'Are you Hispanic/Latino?', 'Race', 'Veteran status', 'Disability status'])
+def test_voluntary_demographic_questions_prompt(tmp_path, label):
+    memory = Memory(tmp_path / 'demographics.sqlite')
+    questions = []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.route('**/*', lambda route: route.fulfill(content_type='text/html', body=f'<label>{label}<select><option value="">Select...</option><option>Decline to answer</option></select></label><button type=submit>Submit</button>'))
+                def ask(question):
+                    questions.append(question)
+                    return UserAnswer('Decline to answer')
+                result = fill_form(page, 'https://example.test', memory, None, ask)
+                assert len(questions) == 1 and questions[0].sensitive
+                assert page.locator('select').input_value() == 'Decline to answer'
+                assert result.submits == 0
+            finally:
+                browser.close()
+    finally:
+        memory.close()

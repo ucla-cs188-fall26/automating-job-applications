@@ -212,20 +212,20 @@
   <section id="settings" class="screen">
     <div class="card">
       <h2 style="margin-top:0;">Model</h2>
-      <label class="field" for="model">Size</label>
+      <label class="field" for="model">Provider</label>
       <select id="model">
-        <option value="0.6b">0.6B (default)</option>
-        <option value="1.7b">1.7B</option>
-        <option value="4b">4B</option>
+        <option value="gpt">GPT (default)</option>
+        <option value="claude">Claude</option>
         <option value="none">None</option>
       </select>
+      <p>Set the provider API key and POCKET_AGENT_AI_MODEL in the server environment. AI requests send application questions and applicant facts to the selected provider.</p>
       <div id="model-files"></div>
       <p><button id="save-settings" class="primary" type="button">Save settings</button></p>
     </div>
   </section>
 </main>
 <script>
-const state = { settings: { model: "0.6b", headless: false }, socket: null, step: null };
+const state = { settings: { model: "gpt", headless: false }, socket: null, step: null };
 
 function show(name) {
   document.querySelectorAll(".screen").forEach((el) => el.classList.toggle("active", el.id === name));
@@ -417,8 +417,7 @@ function renderModels() {
   host.replaceChildren();
   (state.settings.models || []).forEach((item) => {
     const line = document.createElement("p");
-    const size = item.bytes ? `${Math.round(item.bytes / 1000000)} MB on disk` : "not downloaded";
-    line.textContent = `${item.size}: ${item.file} — ${item.present ? size : "not downloaded"}`;
+    line.textContent = `${item.size}: ${item.file} — ${item.present ? "configured" : "not configured"}`;
     host.appendChild(line);
   });
 }

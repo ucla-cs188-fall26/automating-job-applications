@@ -1,4 +1,4 @@
-"""Localhost desk: chat, questions, memory, and settings. No accounts and no cloud."""
+"""Localhost desk with hosted AI, user questions, memory, and settings."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from pocket_agent.cli import _copy_user_files
-from pocket_agent.forms.llm import MODEL_FILES, model_path
 from pocket_agent.forms.memory import Memory
 from pocket_agent.paths import data_home
 from pocket_agent.profile import dump_profile, load_profile
@@ -26,7 +25,7 @@ STATIC = Path(__file__).resolve().parent / "static"
 
 
 class SettingsIn(BaseModel):
-    model: str = "0.6b"
+    model: str = "gpt"
     headless: bool = False
 
 
@@ -48,7 +47,7 @@ def _settings_path() -> Path:
 
 
 def load_settings() -> dict:
-    raw = {"model": "0.6b", "headless": False}
+    raw = {"model": "gpt", "headless": False}
     path = _settings_path()
     if path.exists():
         try:
@@ -57,15 +56,15 @@ def load_settings() -> dict:
             stored = {}
         if isinstance(stored, dict):
             raw.update({key: stored[key] for key in ("model", "headless") if key in stored})
-    if raw["model"] not in {"none", "0.6b", "1.7b", "4b"}:
-        raw["model"] = "0.6b"
+    if raw["model"] not in {"none", "gpt", "claude"}:
+        raw["model"] = "gpt"
     raw["headless"] = bool(raw["headless"])
     return raw
 
 
 def save_settings(payload: SettingsIn) -> dict:
     data = {"model": payload.model, "headless": payload.headless}
-    if data["model"] not in {"none", "0.6b", "1.7b", "4b"}:
+    if data["model"] not in {"none", "gpt", "claude"}:
         raise HTTPException(status_code=400, detail="unknown model")
     path = _settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,16 +73,9 @@ def save_settings(payload: SettingsIn) -> dict:
 
 
 def model_inventory() -> list[dict]:
-    rows = []
-    for size, name in MODEL_FILES.items():
-        path = model_path(size)
-        rows.append({
-            "size": size,
-            "file": name,
-            "present": path.exists(),
-            "bytes": path.stat().st_size if path.exists() else 0,
-        })
-    return rows
+    import os
+    return [{"size": provider, "file": variable, "present": bool(os.environ.get(variable)), "bytes": 0}
+            for provider, variable in (("gpt", "OPENAI_API_KEY"), ("claude", "ANTHROPIC_API_KEY"))]
 
 
 def _memory() -> Memory:
@@ -156,7 +148,7 @@ class Desk:
         from playwright.sync_api import sync_playwright
 
         from pocket_agent.forms.engine import Asked, UserAnswer, fill_form
-        from pocket_agent.forms.llm import LocalDecider
+        from pocket_agent.forms.cloud import create_decider
         from pocket_agent.forms.seed import seed_memory
 
         try:
@@ -185,12 +177,8 @@ class Desk:
                         resume = home / "resume.pdf"
                         seed_memory(memory, profile, resume_path=str(resume) if resume.exists() else "")
                         model_name = str(command.get("model") or settings["model"])
-                        decider = None
-                        if model_name != "none":
-                            decider = LocalDecider(model_name)
-                            if not decider.available:
-                                self.publish({"type": "status", "text": f"Model file missing ({decider.error}). Filling from the profile only."})
-                                decider = None
+                        resume_text = parse_resume(resume).get("text", "") if model_name != "none" and resume.exists() else ""
+                        decider = create_decider(model_name, profile, resume_text, log=lambda text: self.publish({"type": "status", "text": text}))
 
                         def ask(asked: Asked) -> UserAnswer:
                             self.publish({
@@ -225,6 +213,7 @@ class Desk:
                             events=self.publish,
                             navigate=command.get("type") != "continue",
                         )
+                        self.publish({"type": "status", "text": decider.backend.summary() if decider is not None else "[AI] Disabled. Requests attempted: 0."})
                         if run.error:
                             self.publish({"type": "error", "message": run.error})
                     except Exception as exc:  # noqa: BLE001 — surface filler failures on the desk

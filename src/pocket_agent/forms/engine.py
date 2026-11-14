@@ -77,6 +77,10 @@ class FormRun:
     model_seconds: float = 0.0
     current_step: str = ""
     status: str = "stopped"
+    ai_answers: list[dict] = field(default_factory=list)
+    ai_context: str | None = None
+    unresolved: list[str] = field(default_factory=list)
+    validation_errors: list[str] = field(default_factory=list)
 
 
 def fill_form(
@@ -90,6 +94,7 @@ def fill_form(
     resume: bool = False,
     events: EventFn | None = None,
     navigate: bool | None = None,
+    preserve_existing: bool = False,
 ) -> FormRun:
     """resume=True fills the page already open (after the user signed in by hand) instead of loading url."""
     if navigate is not None:
@@ -138,7 +143,10 @@ def fill_form(
                     heading = field.heading
                     _emit(events, {"type": "step", "heading": heading})
                 try:
-                    outcome = _decide_and_write(page, field, memory, resume_path, ask, llm, run, snapshot=snap)
+                    if preserve_existing and not is_blank(field.value) and not _invalid(page, field.uid):
+                        outcome = _outcome(field, None, "keep", field.value, asked=False, from_memory=False)
+                    else:
+                        outcome = _decide_and_write(page, field, memory, resume_path, ask, llm, run, snapshot=snap)
                 except Exception as exc:  # noqa: BLE001 — one stuck widget should not end the whole page
                     outcome = _outcome(field, None, "error", type(exc).__name__, asked=False, from_memory=False)
                 handled.add((field.section, field.label.casefold(), field.group))
@@ -162,7 +170,13 @@ def fill_form(
             run.error = "Stopped after reaching the action limit; application is incomplete."
         final_snapshot = extract_page(page)
         run.current_step = final_snapshot.progress
-        run.status = "review" if progress_is_last(final_snapshot.progress) or re.search(r"\breview\b", final_snapshot.progress, re.I) else "blocked" if run.gate or run.error else "stopped"
+        run.unresolved = [item.label for item in final_snapshot.fields if item.required and is_blank(item.value)]
+        run.validation_errors = page.locator('input:invalid, select:invalid, textarea:invalid, [aria-invalid=true]').evaluate_all(
+            "els => els.filter(el => el.getClientRects().length).map(el => el.validationMessage || el.getAttribute('aria-label') || 'Invalid field')"
+        )
+        review_visible = bool(re.search(r"\breview\b", final_snapshot.progress, re.I))
+        blocked = bool(run.gate or run.error or run.unresolved or run.validation_errors)
+        run.status = "blocked" if blocked else "review" if review_visible else "stopped"
         run.submits = int(page.evaluate("() => window.__pocketSubmits || 0") or 0)
         if "/submitted" in page.url:
             run.submits = max(run.submits, 1)
@@ -345,10 +359,15 @@ def _decide_and_write(page, field: ExtractedField, memory: Memory, resume_path, 
         return _outcome(field, "resume", "skip", "", asked=False, from_memory=False)
     if forced:
         entry = memory.get(forced)
-        # Optional disclosures/preferences must not become blocking questions.
-        # Only an explicitly reusable answer justifies changing these fields.
-        if not field.required and not (entry and entry.always_use and entry.value.strip()):
+        # Demographic surveys are offered to the user even when voluntary.
+        # Other optional preferences still require an explicit reusable answer.
+        demographic = forced in {"gender", "hispanic", "race", "veteran_status", "disability_status", "pronouns"}
+        if not field.required and not demographic and not (entry and entry.always_use and entry.value.strip()):
             return _outcome(field, forced, "skip", field.value, asked=False, from_memory=False)
+        if not (entry and entry.always_use and entry.value.strip()) and forced in {"essay", "cover_letter", "salary_expectation"}:
+            generated = _generate_and_write(page, field, resume_path, llm, run)
+            if generated:
+                return generated
         return _ask_or_saved(page, field, memory, resume_path, ask, forced)
     confirmed = _name_confirmation(page, field, memory, snapshot)
     if confirmed:
@@ -361,26 +380,54 @@ def _decide_and_write(page, field: ExtractedField, memory: Memory, resume_path, 
     key = indexed_key(base, field.group) if base else None
     value = stored_value(memory, key, field.label) if key else ""
     ruled = bool(key and value.strip() and match and match.reason in {"exact", "tokens", "subset", "learned"})
-    agreed = False
-    if ruled and llm is not None and getattr(llm, "available", False) and match is not None and match.reason != "exact":
-        import time
-        started = time.perf_counter()
-        agreed = _llm_fill(field, memory, llm) == key
-        run.model_calls += 1
-        run.model_seconds += time.perf_counter() - started
     if ruled:
         written = _write(page, field, value, resume_path)
         if written:
-            return _outcome(field, key, "fill", written, asked=False, from_memory=True, via_model=agreed)
+            return _outcome(field, key, "fill", written, asked=False, from_memory=True)
         if field.required:
             return _ask_or_saved(page, field, memory, resume_path, ask, key or _label_key(field))
     if field.required and field.value and not is_blank(field.value):
         return _outcome(field, key, "keep", field.value, asked=False, from_memory=False)
     if field.required:
+        generated = _generate_and_write(page, field, resume_path, llm, run)
+        if generated:
+            return generated
         return _ask_or_saved(page, field, memory, resume_path, ask, key or _label_key(field))
     # Unknown optional fields may already contain resume-parsed or user-entered
     # values. Leaving them alone is safer than erasing them.
     return _outcome(field, key, "skip", field.value, asked=False, from_memory=False)
+
+
+def _generate_and_write(page, field, resume_path, llm, run):
+    if llm is None or not hasattr(llm, "generate") or field.kind == "file":
+        return None
+    started = time.perf_counter()
+    try:
+        generator = getattr(llm, "salary", None) if ask_key(field.label, field.section) == "salary_expectation" else llm
+        if generator is None:
+            return None
+        if run.ai_context is None:
+            # Stable job context: changing input values must not invalidate response caches.
+            text = page.locator("body").evaluate(r"""body => {
+                const clone = body.cloneNode(true);
+                clone.querySelectorAll('script, style, input, textarea, select, [role=combobox], [role=listbox]').forEach(el => el.remove());
+                return clone.textContent.replace(/\s+/g, ' ').trim();
+            }""")
+            run.ai_context = page.url + "\n" + text[:7800]
+        answer = generator.generate(label=field.label, kind=field.kind,
+            options=[option["label"] for option in field.options if option.get("label")],
+            job_context=run.ai_context)
+        if answer:
+            written = _write(page, field, answer.value, resume_path)
+            if written:
+                run.ai_answers.append({"label": field.label, "value": written, "evidence": answer.evidence})
+                return _outcome(field, None, "fill", written, asked=False, from_memory=False, via_model=True)
+    except Exception:
+        pass
+    finally:
+        run.model_calls += 1
+        run.model_seconds += time.perf_counter() - started
+    return None
 
 
 def _label_key(field: ExtractedField) -> str:
